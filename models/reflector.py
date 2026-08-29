@@ -52,7 +52,7 @@ class MFReflector:
     z_step_v: float = 0.0
 
     # Solve patch parameter
-    patch_fit_method: PatchFitMethod = PatchFitMethod.EXACT
+    patch_fit_method: PatchFitMethod = PatchFitMethod.APPROXIMATE
     fit_patches_u: int = 1
     fit_patches_v: int = 1
     fit_patch_continuity_u: PatchContinuity = PatchContinuity.POINT

@@ -205,9 +205,11 @@ def _approximate_nurbs_from_grid(
     dv = max(1, min(int(degree_v), nv - 1))
 
     def target_count(n: int, degree: int) -> int:
+        """Fewer controls than samples → smoother curvature (LS approximation)."""
         if n <= degree + 1:
             return n
-        return max(degree + 1, min(n - 1, (n + 1) // 2))
+        # Aim for roughly degree+2 .. n/2 controls
+        return max(degree + 1, min(n - 1, max(degree + 2, (n + 2) // 3)))
 
     ncu, ncv = target_count(nu, du), target_count(nv, dv)
     if ncu >= nu and ncv >= nv:

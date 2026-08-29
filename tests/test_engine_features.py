@@ -57,6 +57,7 @@ def _reflector(n_u=1, n_v=1, gap_type=GapType.GAP, surface_mode=GapSurfaceMode.E
         mesh_u=7,
         mesh_v=7,
         solver_iterations=2,
+        patch_fit_method=PatchFitMethod.EXACT,
     )
 
 
@@ -69,7 +70,9 @@ def test_start_point_and_per_facet_solver():
     assert z.shape == (13, 13)
     assert x.min() == -4.0 and x.max() == 4.0
     assert y.min() == -4.0 and y.max() == 4.0
+    assert np.std(z) > 1e-6
 
+    # Changing calculation start on the seed facet changes the integrated shape
     reflector.calculation_start_u = 0.75
     reflector.calculation_start_v = 0.25
     _, _, z2, _, _ = __import__(
@@ -99,9 +102,18 @@ def test_gap_surface_closes_corner_hole():
 
 
 def test_gap_shrink_is_derived_without_hardcoded_cap():
+    # deltas include gap: edge facet optical width = delta - gap/2
+    # width_delta=4, gap=1 → edge optical = 4 - 0.5 = 3.5
     facets = generate_facets(_reflector(2, 1, GapType.GAP, GapSurfaceMode.EMPTY))
     widths = [float(np.ptp(f.corners[:, 0])) for f in facets]
-    assert np.allclose(widths, 3.0, atol=1e-8)
+    assert np.allclose(widths, 3.5, atol=1e-8)
+
+    # middle facet in 3-column grid: optical = delta - gap = 4 - 1 = 3.0
+    facets3 = generate_facets(_reflector(3, 1, GapType.GAP, GapSurfaceMode.EMPTY))
+    widths3 = [float(np.ptp(f.corners[:, 0])) for f in facets3]
+    assert abs(widths3[0] - 3.5) < 1e-8
+    assert abs(widths3[1] - 3.0) < 1e-8
+    assert abs(widths3[2] - 3.5) < 1e-8
 
 
 def test_no_gap_new_border_makes_edges_touch():

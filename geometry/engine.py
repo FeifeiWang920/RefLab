@@ -193,7 +193,141 @@ def _inherit_edge(
     return raw + delta[:, None] * weights
 
 
+
+def _fair_height_block(z: np.ndarray, iterations: int = 12, strength: float = 0.4) -> np.ndarray:
+    """Laplacian fairing; boundaries fixed."""
+    if z.shape[0] < 3 or z.shape[1] < 3 or iterations <= 0:
+        return z
+    out = z.astype(float, copy=True)
+    for _ in range(iterations):
+        lap = (
+            out[:-2, 1:-1] + out[2:, 1:-1] + out[1:-1, :-2] + out[1:-1, 2:]
+            - 4.0 * out[1:-1, 1:-1]
+        )
+        out[1:-1, 1:-1] += strength * 0.25 * lap
+    return out
+
+
+def _reconstruct_height_from_slopes(
+    dzx: np.ndarray,
+    dzy: np.ndarray,
+    x_coords: Sequence[float],
+    y_coords: Sequence[float],
+    z_seed: float,
+    seed_i: int,
+    seed_j: int,
+    iterations: int = 40,
+) -> np.ndarray:
+    """
+    Build a smooth height field whose gradient matches (dzx, dzy) in LS sense.
+
+    Discrete slope fields from the reflection law are generally *not* conservative
+    (path-dependent).  Naive row/column integration therefore leaves kinks.
+    We use Southwell-style iterative integration (average of successive
+    horizontal and vertical sweeps) which yields a much fairer surface while
+    still honouring the desired slopes.
+    """
+    nv, nu = dzx.shape
+    xs = np.asarray(x_coords, dtype=float)
+    ys = np.asarray(y_coords, dtype=float)
+    z = np.zeros((nv, nu), dtype=float)
+
+    def sweep_from_seed(z0: np.ndarray) -> np.ndarray:
+        out = z0.copy()
+        # horizontal through seed row
+        j = seed_j
+        for i in range(seed_i + 1, nu):
+            dx = xs[i] - xs[i - 1]
+            out[j, i] = out[j, i - 1] + 0.5 * (dzx[j, i] + dzx[j, i - 1]) * dx
+        for i in range(seed_i - 1, -1, -1):
+            dx = xs[i] - xs[i + 1]
+            out[j, i] = out[j, i + 1] + 0.5 * (dzx[j, i] + dzx[j, i + 1]) * dx
+        # vertical through every column
+        for i in range(nu):
+            for j in range(seed_j + 1, nv):
+                dy = ys[j] - ys[j - 1]
+                out[j, i] = out[j - 1, i] + 0.5 * (dzy[j, i] + dzy[j - 1, i]) * dy
+            for j in range(seed_j - 1, -1, -1):
+                dy = ys[j] - ys[j + 1]
+                out[j, i] = out[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
+        return out
+
+    def sweep_v_first(z0: np.ndarray) -> np.ndarray:
+        out = z0.copy()
+        i = seed_i
+        for j in range(seed_j + 1, nv):
+            dy = ys[j] - ys[j - 1]
+            out[j, i] = out[j - 1, i] + 0.5 * (dzy[j, i] + dzy[j - 1, i]) * dy
+        for j in range(seed_j - 1, -1, -1):
+            dy = ys[j] - ys[j + 1]
+            out[j, i] = out[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
+        for j in range(nv):
+            for i in range(seed_i + 1, nu):
+                dx = xs[i] - xs[i - 1]
+                out[j, i] = out[j, i - 1] + 0.5 * (dzx[j, i] + dzx[j, i - 1]) * dx
+            for i in range(seed_i - 1, -1, -1):
+                dx = xs[i] - xs[i + 1]
+                out[j, i] = out[j, i + 1] + 0.5 * (dzx[j, i] + dzx[j, i + 1]) * dx
+        return out
+
+    z[seed_j, seed_i] = z_seed
+    z = 0.5 * (sweep_from_seed(z) + sweep_v_first(z))
+    z += z_seed - z[seed_j, seed_i]
+
+    # Iterative gradient matching (relax toward desired slopes)
+    for _ in range(max(1, iterations)):
+        # Estimate current discrete slopes
+        cx = np.zeros_like(z)
+        cy = np.zeros_like(z)
+        for j in range(nv):
+            for i in range(1, nu - 1):
+                cx[j, i] = (z[j, i + 1] - z[j, i - 1]) / (xs[i + 1] - xs[i - 1])
+            if nu > 1:
+                cx[j, 0] = (z[j, 1] - z[j, 0]) / (xs[1] - xs[0])
+                cx[j, -1] = (z[j, -1] - z[j, -2]) / (xs[-1] - xs[-2])
+        for i in range(nu):
+            for j in range(1, nv - 1):
+                cy[j, i] = (z[j + 1, i] - z[j - 1, i]) / (ys[j + 1] - ys[j - 1])
+            if nv > 1:
+                cy[0, i] = (z[1, i] - z[0, i]) / (ys[1] - ys[0])
+                cy[-1, i] = (z[-1, i] - z[-2, i]) / (ys[-1] - ys[-2])
+        # Residual and correct by a damped Poisson-like step
+        rx = dzx - cx
+        ry = dzy - cy
+        corr = np.zeros_like(z)
+        for j in range(1, nv - 1):
+            for i in range(1, nu - 1):
+                # integrate residual roughly
+                corr[j, i] = 0.25 * (
+                    (rx[j, i + 1] - rx[j, i - 1]) * 0.5 * (xs[i + 1] - xs[i - 1]) * 0.25
+                    + (ry[j + 1, i] - ry[j - 1, i]) * 0.5 * (ys[j + 1] - ys[j - 1]) * 0.25
+                )
+        z[1:-1, 1:-1] += 0.5 * corr[1:-1, 1:-1]
+        z += z_seed - z[seed_j, seed_i]
+
+    return z
+
+
 def _build_height_field(reflector: MFReflector):
+    """
+    LucidShape-style ordered per-facet solve.
+
+    From FunGeo / MF dialog (Set F.Start, Other Settings):
+      - patch calculation sequence: vertical-first or horizontal-first
+        (our SolveMethod) defines the order facets are computed.
+      - Each facet is integrated independently for its own spreads.
+      - calculation start (U,V): seed of the relative integration inside
+        the facet; default (0,0) or automatic = reference position.
+      - reference position (U,V) along the shared edge: controls how the
+        new facet connects to the already-computed neighbour.  We apply a
+        *rigid Z offset* so the surface at the reference point matches the
+        neighbour (preserves the optical shape of the new facet).
+      - optional use_base_curve_from_neighbor: match the full shared-edge
+        curve instead of a single reference point.
+      - Z steps: added per facet index after matching.
+
+    Facets are intentionally *not* one C1 surface — gaps separate them.
+    """
     grid = reflector.grid
     spreads = reflector.spreads
     source = reflector.source.position.copy()
@@ -223,128 +357,135 @@ def _build_height_field(reflector: MFReflector):
     y_list.append(y_edges[-1])
     y_coords = np.asarray(y_list, dtype=float)
 
-    z_carrier = np.asarray(
-        [
-            [_carrier_z(x_coords[i], y_coords[j], source, focal) for i in range(nu)]
-            for j in range(nv)
-        ],
-        dtype=float,
-    )
+    z = np.zeros((nv, nu), dtype=float)
 
-    def node_target(i: int, j: int) -> np.ndarray:
-        iu = min(i // (su - 1), n_u - 1)
-        iv = min(j // (sv - 1), n_v - 1)
-        local_u = min(max((i - iu * (su - 1)) / (su - 1), 0.0), 1.0)
-        local_v = min(max((j - iv * (sv - 1)) / (sv - 1), 0.0), 1.0)
-        h_deg, v_deg = spreads.target_angles_on_facet(iu, iv, local_u, local_v)
-        return _target_direction_from_angles(h_deg, v_deg)
-
-    def slopes(z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        dzx = np.zeros_like(z)
-        dzy = np.zeros_like(z)
-        for j in range(nv):
-            for i in range(nu):
-                point = np.array([x_coords[i], y_coords[j], z[j, i]])
-                target = node_target(i, j)
-                n_required = _required_normal(source, point, target)
-                n_carrier = _carrier_normal(x_coords[i], y_coords[j], source, focal)
-                sx_r, sy_r = _slopes_from_normal(n_required)
-                sx_c, sy_c = _slopes_from_normal(n_carrier)
-                dzx[j, i] = sx_r - sx_c
-                dzy[j, i] = sy_r - sy_c
-        return dzx, dzy
+    z_step_u = reflector.z_step_u + reflector.gaps.effective_step_z()
+    z_step_v = reflector.z_step_v + reflector.gaps.effective_step_z()
 
     start_iu, start_iv, start_local_u, start_local_v = _start_facet(reflector)
     solve_order = _solve_order(n_u, n_v, (start_iu, start_iv), order)
-    start_index = solve_order[0]
-    z = z_carrier.copy()
 
-    z_step_u = reflector.z_step_u
-    z_step_v = reflector.z_step_v
-    gap_z_step = reflector.gaps.effective_step_z()
-    if gap_z_step:
-        z_step_u += gap_z_step
-        z_step_v += gap_z_step
+    # Store each solved facet block for neighbour lookup
+    solved: Dict[Tuple[int, int], np.ndarray] = {}
 
-    for _ in range(max(1, int(reflector.solver_iterations))):
-        dzx, dzy = slopes(z)
-        z_next = z.copy()
-        solved: Dict[Tuple[int, int], np.ndarray] = {}
+    for iu, iv in solve_order:
+        i0 = iu * (su - 1)
+        j0 = iv * (sv - 1)
+        xs = x_coords[i0:i0 + su]
+        ys = y_coords[j0:j0 + sv]
 
-        for iu, iv in solve_order:
-            i0 = iu * (su - 1)
-            j0 = iv * (sv - 1)
-            xs = x_coords[i0:i0 + su]
-            ys = y_coords[j0:j0 + sv]
-            carrier = z_carrier[j0:j0 + sv, i0:i0 + su]
-            is_start = (iu, iv) == start_index
-            facet_start_u = (
-                start_local_u
-                if is_start
-                else (
-                    reflector.calculation_start_u
-                    if reflector.calculation_start_u is not None
-                    else reflector.reference_position_u
-                )
-            )
-            facet_start_v = (
-                start_local_v
-                if is_start
-                else (
-                    reflector.calculation_start_v
-                    if reflector.calculation_start_v is not None
-                    else reflector.reference_position_v
-                )
-            )
-            raw = _integrate_relative(
-                dzx[j0:j0 + sv, i0:i0 + su],
-                dzy[j0:j0 + sv, i0:i0 + su],
-                xs,
-                ys,
-                carrier,
-                order,
-                start_i=int(round(facet_start_u * (su - 1))),
-                start_j=int(round(facet_start_v * (sv - 1))),
-            )
+        carrier = np.asarray(
+            [[_carrier_z(xs[i], ys[j], source, focal) for i in range(su)]
+             for j in range(sv)],
+            dtype=float,
+        )
 
-            if not solved:
-                si = int(round(start_local_u * (su - 1)))
-                sj = int(round(start_local_v * (sv - 1)))
-                reference_z = (
-                    _carrier_z(xs[si], ys[sj], source, focal)
-                    + grid.start_z
-                    + grid.offset_z
-                )
-                raw += reference_z - raw[sj, si]
+        def local_target(li: int, lj: int) -> np.ndarray:
+            lu = li / max(su - 1, 1)
+            lv = lj / max(sv - 1, 1)
+            h_deg, v_deg = spreads.target_angles_on_facet(iu, iv, lu, lv)
+            return _target_direction_from_angles(h_deg, v_deg)
+
+        # --- calculation start (F.Start / auto = reference) ---
+        is_seed_facet = (iu, iv) == (start_iu, start_iv)
+        if is_seed_facet:
+            seed_u = start_local_u
+            seed_v = start_local_v
+        else:
+            # automatic start point uses reference position (LS doc)
+            if reflector.calculation_start_u is not None:
+                seed_u = float(reflector.calculation_start_u)
             else:
-                candidates = (
-                    [(iu, iv - 1), (iu - 1, iv)]
-                    if order == SolveMethod.V_FIRST
-                    else [(iu - 1, iv), (iu, iv - 1)]
-                )
-                for niu, niv in candidates:
-                    if (niu, niv) not in solved:
-                        continue
-                    shared_axis = "v" if niv != iv else "u"
-                    raw = _inherit_edge(
-                        raw,
-                        solved[(niu, niv)],
-                        shared_axis,
-                        reflector.reference_position_u if shared_axis == "v" else reflector.reference_position_v,
-                        reflector.use_base_curve_from_neighbor,
-                    )
+                seed_u = float(reflector.reference_position_u)
+            if reflector.calculation_start_v is not None:
+                seed_v = float(reflector.calculation_start_v)
+            else:
+                seed_v = float(reflector.reference_position_v)
+        seed_i = int(np.clip(round(seed_u * (su - 1)), 0, su - 1))
+        seed_j = int(np.clip(round(seed_v * (sv - 1)), 0, sv - 1))
+
+        # --- independent optical integration on this facet ---
+        # Desired *absolute* slopes from reflection law (on carrier seed), then
+        # reconstruct a fair height field (Southwell) so the facet is smooth.
+        z_loc = carrier.copy()
+        for _ in range(max(1, int(reflector.solver_iterations))):
+            dzx_abs = np.zeros((sv, su))
+            dzy_abs = np.zeros((sv, su))
+            for lj in range(sv):
+                for li in range(su):
+                    pt = np.array([xs[li], ys[lj], z_loc[lj, li]])
+                    n_req = _required_normal(source, pt, local_target(li, lj))
+                    sx, sy = _slopes_from_normal(n_req)
+                    dzx_abs[lj, li] = sx
+                    dzy_abs[lj, li] = sy
+            z_new = _reconstruct_height_from_slopes(
+                dzx_abs, dzy_abs, xs, ys,
+                z_seed=float(carrier[seed_j, seed_i]),
+                seed_i=seed_i, seed_j=seed_j,
+                iterations=30,
+            )
+            delta = float(np.max(np.abs(z_new - z_loc)))
+            z_loc = z_new
+            if delta <= max(0.0, float(reflector.solver_tolerance)):
+                break
+
+        # --- neighbour influence: rigid offset (and optional edge curve) ---
+        if not solved:
+            # First facet: absolute height from carrier + grid offsets
+            ref_z = carrier[seed_j, seed_i] + grid.start_z + grid.offset_z
+            z_loc += ref_z - z_loc[seed_j, seed_i]
+        else:
+            # Prefer neighbour consistent with path calculation sequence
+            candidates = (
+                [(iu, iv - 1), (iu - 1, iv)]
+                if order == SolveMethod.V_FIRST
+                else [(iu - 1, iv), (iu, iv - 1)]
+            )
+            matched = False
+            for niu, niv in candidates:
+                if (niu, niv) not in solved:
+                    continue
+                neigh = solved[(niu, niv)]
+                # Shared edge: neighbour right/top vs this left/bottom
+                if niu == iu - 1 and niv == iv:
+                    # shared vertical edge: neigh[:, -1] vs z_loc[:, 0]
+                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
+                    idx = int(round(ref * (sv - 1)))
+                    if reflector.use_base_curve_from_neighbor:
+                        # match full edge curve with rigid-ish average offset
+                        # (single scalar keeps optical shape; curve match via mean)
+                        offset = float(np.mean(neigh[:, -1] - z_loc[:, 0]))
+                    else:
+                        offset = float(neigh[idx, -1] - z_loc[idx, 0])
+                    z_loc += offset
+                    matched = True
+                elif niu == iu and niv == iv - 1:
+                    # shared horizontal edge: neigh[-1, :] vs z_loc[0, :]
+                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
+                    idx = int(round(ref * (su - 1)))
+                    if reflector.use_base_curve_from_neighbor:
+                        offset = float(np.mean(neigh[-1, :] - z_loc[0, :]))
+                    else:
+                        offset = float(neigh[-1, idx] - z_loc[0, idx])
+                    z_loc += offset
+                    matched = True
+                if matched:
                     break
+            if not matched:
+                ref_z = carrier[seed_j, seed_i] + grid.start_z + grid.offset_z
+                z_loc += ref_z - z_loc[seed_j, seed_i]
 
-            raw += iu * z_step_u + iv * z_step_v
-            z_next[j0:j0 + sv, i0:i0 + su] = raw
-            solved[(iu, iv)] = raw
+        # Z step for this facet index
+        z_loc = z_loc + (iu * z_step_u + iv * z_step_v)
 
-        delta = float(np.max(np.abs(z_next - z)))
-        z = z_next
-        if delta <= max(0.0, float(reflector.solver_tolerance)):
-            break
+        # Fair interior to reduce curvature spikes (boundary fixed)
+        z_loc = _fair_height_block(z_loc, iterations=8, strength=0.35)
+
+        solved[(iu, iv)] = z_loc.copy()
+        z[j0:j0 + sv, i0:i0 + su] = z_loc
 
     return x_coords, y_coords, z, su, sv
+
 
 def _bilinear_sample(grid_pts: np.ndarray, u: float, v: float) -> np.ndarray:
     sv, su, _ = grid_pts.shape
@@ -361,15 +502,41 @@ def _bilinear_sample(grid_pts: np.ndarray, u: float, v: float) -> np.ndarray:
     )
 
 
-def _shrink_grid(grid_pts: np.ndarray, shrink_u: float, shrink_v: float) -> np.ndarray:
-    if shrink_u <= 0.0 and shrink_v <= 0.0:
+def _shrink_grid(
+    grid_pts: np.ndarray,
+    shrink_left: float = 0.0,
+    shrink_right: float = 0.0,
+    shrink_bottom: float = 0.0,
+    shrink_top: float = 0.0,
+) -> np.ndarray:
+    """
+    Shrink a facet sample grid in parameter space.
+
+    LucidShape: width/height *deltas include the gap*.  Half of each internal
+    gap is taken from each adjacent facet, so:
+      - middle facet optical width = delta - gap
+      - edge facet optical width   = delta - gap/2
+    Outer borders (no neighbour) are not shrunk.
+    """
+    if (
+        shrink_left <= 0.0
+        and shrink_right <= 0.0
+        and shrink_bottom <= 0.0
+        and shrink_top <= 0.0
+    ):
         return grid_pts
     sv, su, _ = grid_pts.shape
+    u0 = float(shrink_left)
+    u1 = 1.0 - float(shrink_right)
+    v0 = float(shrink_bottom)
+    v1 = 1.0 - float(shrink_top)
+    if u1 <= u0 or v1 <= v0:
+        raise ValueError("gap shrink would consume the entire facet")
     result = np.zeros_like(grid_pts)
     for j in range(sv):
-        v = shrink_v + (1.0 - 2.0 * shrink_v) * (j / max(sv - 1, 1))
+        v = v0 + (v1 - v0) * (j / max(sv - 1, 1))
         for i in range(su):
-            u = shrink_u + (1.0 - 2.0 * shrink_u) * (i / max(su - 1, 1))
+            u = u0 + (u1 - u0) * (i / max(su - 1, 1))
             result[j, i] = _bilinear_sample(grid_pts, u, v)
     return result
 
@@ -419,15 +586,19 @@ def _make_facet_nurbs_from_grid(
     samples_v: int,
     source,
     spreads,
-    shrink_u: float = 0.0,
-    shrink_v: float = 0.0,
+    shrink_left: float = 0.0,
+    shrink_right: float = 0.0,
+    shrink_bottom: float = 0.0,
+    shrink_top: float = 0.0,
     fit_method: PatchFitMethod = PatchFitMethod.EXACT,
     uniform_parameters: bool = False,
     patch_index_u: int = 0,
     patch_index_v: int = 0,
     z_step: float = 0.0,
 ) -> Facet:
-    pts = _shrink_grid(sub_pts, shrink_u, shrink_v)
+    pts = _shrink_grid(
+        sub_pts, shrink_left, shrink_right, shrink_bottom, shrink_top
+    )
     ctrl, du, dv, ku, kv = make_nurbs_from_grid(
         pts, degree_u, degree_v, fit_method, uniform_parameters
     )
@@ -483,8 +654,10 @@ def _make_facet_patches(
     degree_v: int,
     source,
     spreads,
-    shrink_u: float,
-    shrink_v: float,
+    shrink_left: float,
+    shrink_right: float,
+    shrink_bottom: float,
+    shrink_top: float,
     fit_method: PatchFitMethod,
     patches_u: int,
     patches_v: int,
@@ -500,7 +673,9 @@ def _make_facet_patches(
         PatchContinuity.TANGENT,
         PatchContinuity.CURVATURE,
     )
-    shrunk_pts = _shrink_grid(sub_pts, shrink_u, shrink_v)
+    shrunk_pts = _shrink_grid(
+        sub_pts, shrink_left, shrink_right, shrink_bottom, shrink_top
+    )
     ranges_u = _patch_ranges(shrunk_pts.shape[1], patches_u)
     ranges_v = _patch_ranges(shrunk_pts.shape[0], patches_v)
     facets: List[Facet] = []
@@ -517,6 +692,8 @@ def _make_facet_patches(
                     max(2, j1 - j0),
                     source,
                     spreads,
+                    0.0,
+                    0.0,
                     0.0,
                     0.0,
                     fit_method,
@@ -783,6 +960,30 @@ def _apply_no_gap_borders(
         facets, n_u, n_v, mode, preserve_z, source, spreads
     )
 
+
+def _reparam_arc_length(edge: np.ndarray, n: int) -> np.ndarray:
+    """Resample a polyline edge to n points by normalised arc length."""
+    edge = np.asarray(edge, dtype=float)
+    if len(edge) == 0:
+        return edge
+    if len(edge) == 1 or n <= 1:
+        return np.repeat(edge[:1], n, axis=0)
+    seg = np.linalg.norm(np.diff(edge, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    if cum[-1] < 1e-14:
+        return np.repeat(edge[:1], n, axis=0)
+    cum /= cum[-1]
+    targets = np.linspace(0.0, 1.0, n)
+    out = np.zeros((n, 3))
+    for k, t in enumerate(targets):
+        idx = int(np.searchsorted(cum, t, side="right") - 1)
+        idx = min(max(idx, 0), len(edge) - 2)
+        t0, t1 = cum[idx], cum[idx + 1]
+        alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+        out[k] = (1.0 - alpha) * edge[idx] + alpha * edge[idx + 1]
+    return out
+
+
 def _make_gap_surface(
     edge_a: np.ndarray,
     edge_b: np.ndarray,
@@ -790,35 +991,35 @@ def _make_gap_surface(
     samples_v: int,
     degree: int = 1,
 ) -> Facet:
-    n = min(len(edge_a), len(edge_b))
-    ctrl = np.stack([edge_a[:n], edge_b[:n]], axis=0)
+    """Ruled NURBS strip between two facing edges (arc-length matched)."""
+    n = max(2, max(len(edge_a), len(edge_b)))
+    # Match parameterisation by arc length to avoid twisted rulings
+    ea = _reparam_arc_length(edge_a, n)
+    eb = _reparam_arc_length(edge_b, n)
+    ctrl = np.stack([ea, eb], axis=0)  # (2, n, 3)
     deg_v = 1
-    deg_u = min(degree, n - 1) if n > 1 else 1
+    deg_u = min(max(1, degree), n - 1)
     from geometry.nurbs import open_uniform_knots
     knots_v = open_uniform_knots(2, deg_v)
     knots_u = open_uniform_knots(n, deg_u)
-    corners = np.array([edge_a[0], edge_a[n - 1], edge_b[n - 1], edge_b[0]])
+    corners = np.array([ea[0], ea[n - 1], eb[n - 1], eb[0]])
     center = corners.mean(axis=0)
-    t1 = edge_a[n - 1] - edge_a[0]
-    t2 = edge_b[0] - edge_a[0]
+    t1 = ea[n - 1] - ea[0]
+    t2 = eb[0] - ea[0]
     nrm = np.cross(t1, t2)
     normal = _unit(nrm) if np.linalg.norm(nrm) > 1e-12 else np.array([0.0, 0.0, 1.0])
     return Facet(
-        index_u=-1,
-        index_v=-1,
-        center=center,
-        normal=normal,
-        size_u=float(np.linalg.norm(edge_a[n - 1] - edge_a[0])),
-        size_v=float(np.linalg.norm(edge_b[0] - edge_a[0])),
+        index_u=-1, index_v=-1,
+        center=center, normal=normal,
+        size_u=float(np.linalg.norm(ea[n - 1] - ea[0])),
+        size_v=float(np.linalg.norm(eb[0] - ea[0])),
         corners=corners,
+        # Few samples across the narrow gap → avoid ladder-looking mesh
         samples_u=max(2, n),
-        samples_v=max(2, samples_v),
+        samples_v=2,
         is_nurbs=True,
-        ctrl=ctrl,
-        degree_u=deg_u,
-        degree_v=deg_v,
-        knots_u=knots_u,
-        knots_v=knots_v,
+        ctrl=ctrl, degree_u=deg_u, degree_v=deg_v,
+        knots_u=knots_u, knots_v=knots_v,
         is_gap_surface=True,
     )
 
@@ -946,11 +1147,16 @@ def generate_facets(
             ].copy()
             width = grid.width_deltas[iu]
             height = grid.height_deltas[iv]
-            shrink_u = gap_u / (2.0 * width) if gap_u else 0.0
-            shrink_v = gap_v / (2.0 * height) if gap_v else 0.0
-            if shrink_u >= 0.5 or shrink_v >= 0.5:
+            # deltas include gap: internal side loses gap/2, outer side loses 0
+            half_gu = (gap_u * 0.5 / width) if gap_u and width > 0 else 0.0
+            half_gv = (gap_v * 0.5 / height) if gap_v and height > 0 else 0.0
+            shrink_left = half_gu if iu > 0 else 0.0
+            shrink_right = half_gu if iu < n_u - 1 else 0.0
+            shrink_bottom = half_gv if iv > 0 else 0.0
+            shrink_top = half_gv if iv < n_v - 1 else 0.0
+            if shrink_left + shrink_right >= 1.0 - 1e-9 or shrink_bottom + shrink_top >= 1.0 - 1e-9:
                 raise ValueError(
-                    "gap size must be smaller than the adjacent facet size; "
+                    "gap size must be smaller than the facet delta; "
                     "derived shrink would consume an entire facet"
                 )
             z_step = iu * z_step_u + iv * z_step_v
@@ -966,8 +1172,10 @@ def generate_facets(
                         sv,
                         source,
                         spreads,
-                        shrink_u,
-                        shrink_v,
+                        shrink_left,
+                        shrink_right,
+                        shrink_bottom,
+                        shrink_top,
                         reflector.patch_fit_method,
                         uniform_parameters=no_gap_borders,
                         z_step=z_step,
@@ -983,8 +1191,10 @@ def generate_facets(
                         degree_v,
                         source,
                         spreads,
-                        shrink_u,
-                        shrink_v,
+                        shrink_left,
+                        shrink_right,
+                        shrink_bottom,
+                        shrink_top,
                         reflector.patch_fit_method,
                         reflector.fit_patches_u,
                         reflector.fit_patches_v,

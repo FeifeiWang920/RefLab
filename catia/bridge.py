@@ -18,7 +18,6 @@ import os
 import sys
 import tempfile
 import time
-import win32com.client
 
 
 class CatiaState(str, Enum):
@@ -246,7 +245,13 @@ def _convert_step_to_catpart(catia, stp_path: Path) -> tuple[Any, Path]:
             _close_doc(catia, step_doc)
 
     try:
-        catpart_doc = win32com.client.dynamic.Dispatch(catia.Documents.Open(str(catpart_path)))
+        import win32com.client
+        # Open returns a document; wrap with dynamic Dispatch for late-bound COM.
+        raw = catia.Documents.Open(str(catpart_path))
+        try:
+            catpart_doc = win32com.client.dynamic.Dispatch(raw)
+        except Exception:
+            catpart_doc = raw
         # Let CATIA finish building the translated feature tree.
         time.sleep(0.5)
         return catpart_doc, catpart_path

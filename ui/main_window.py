@@ -91,53 +91,133 @@ class MFReflectorApp:
         source = ttk.LabelFrame(tab, text="Source (Point)", padding=8)
         source.pack(fill=tk.X, pady=(0, 8))
         self.src_z = self._add_entry(source, "Z position [mm]", "0.0", 0)
-        self.focal = self._add_entry(source, "Carrier focal [mm]", "25.0", 1)
+        self.focal = self._add_entry(source, "Carrier focal [mm]", "10.0", 1)
 
-        grid = ttk.LabelFrame(tab, text="Grid Layout (Classic)", padding=8)
-        grid.pack(fill=tk.X)
-        self.n_u = self._add_entry(grid, "# Facets U", "4", 0)
-        self.n_v = self._add_entry(grid, "# Facets V", "4", 1)
-        self.size_u = self._add_entry(grid, "Total size U [mm]", "40.0", 2)
-        self.size_v = self._add_entry(grid, "Total size V [mm]", "40.0", 3)
-        self.degree = self._add_entry(grid, "NURBS degree U/V", "3", 4)
+        # LucidShape-style size row: degree | #facets | offset | startZ
+        size = ttk.LabelFrame(tab, text="Size (LucidShape)", padding=8)
+        size.pack(fill=tk.X, pady=(0, 8))
 
-        hint = ttk.Label(
-            tab,
-            text="Grid is centered in XY. Width/height deltas are generated uniformly.",
-            wraplength=620,
+        # Row 0 labels
+        ttk.Label(size, text="degree U,V").grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(size, text="# facets U,V").grid(row=0, column=2, columnspan=2, sticky=tk.W, padx=(12, 0))
+        ttk.Label(size, text="offset X,Y").grid(row=0, column=4, columnspan=2, sticky=tk.W, padx=(12, 0))
+        ttk.Label(size, text="start Z").grid(row=0, column=6, sticky=tk.W, padx=(12, 0))
+
+        self.degree_u = tk.StringVar(value="5")
+        self.degree_v = tk.StringVar(value="5")
+        self.n_u = tk.StringVar(value="4")
+        self.n_v = tk.StringVar(value="4")
+        self.offset_x = tk.StringVar(value="-20")
+        self.offset_y = tk.StringVar(value="-20")
+        self.start_z = tk.StringVar(value="0")
+
+        ttk.Entry(size, textvariable=self.degree_u, width=6).grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(size, textvariable=self.degree_v, width=6).grid(row=1, column=1, sticky=tk.W, pady=2, padx=(2, 0))
+        ttk.Entry(size, textvariable=self.n_u, width=6).grid(row=1, column=2, sticky=tk.W, pady=2, padx=(12, 0))
+        ttk.Entry(size, textvariable=self.n_v, width=6).grid(row=1, column=3, sticky=tk.W, pady=2, padx=(2, 0))
+        ttk.Entry(size, textvariable=self.offset_x, width=8).grid(row=1, column=4, sticky=tk.W, pady=2, padx=(12, 0))
+        ttk.Entry(size, textvariable=self.offset_y, width=8).grid(row=1, column=5, sticky=tk.W, pady=2, padx=(2, 0))
+        ttk.Entry(size, textvariable=self.start_z, width=8).grid(row=1, column=6, sticky=tk.W, pady=2, padx=(12, 0))
+
+        # width / height deltas (comma-separated, one value per facet)
+        deltas = ttk.LabelFrame(tab, text="Facet size deltas [mm]", padding=8)
+        deltas.pack(fill=tk.X)
+        ttk.Label(deltas, text="width deltas").grid(row=0, column=0, sticky=tk.W)
+        self.width_deltas = tk.StringVar(value="10,10,10,10")
+        ttk.Entry(deltas, textvariable=self.width_deltas, width=48).grid(
+            row=0, column=1, sticky=tk.EW, padx=6, pady=2
         )
-        hint.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(deltas, text="height deltas").grid(row=1, column=0, sticky=tk.W)
+        self.height_deltas = tk.StringVar(value="10,10,10,10")
+        ttk.Entry(deltas, textvariable=self.height_deltas, width=48).grid(
+            row=1, column=1, sticky=tk.EW, padx=6, pady=2
+        )
+        deltas.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            tab,
+            text="width/height deltas: comma-separated sizes for each facet column/row "
+                 "(length should match # facets U / V). "
+                 "offset X,Y is the lower-left corner of the aperture; start Z is the "
+                 "reference height for the first facet seed.",
+            wraplength=660,
+        ).pack(fill=tk.X, pady=(10, 0))
 
     def _build_gaps_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="Gaps")
 
-        frame = ttk.LabelFrame(tab, text="Gap Parameters", padding=8)
+        frame = ttk.LabelFrame(tab, text="Gap Parameter (LucidShape)", padding=8)
         frame.pack(fill=tk.X)
-        self.gap_enable = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="Enable gaps", variable=self.gap_enable).grid(
-            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 4)
-        )
-        self.gap_u = self._add_entry(frame, "Gap U [mm]", "0.5", 1)
-        self.gap_v = self._add_entry(frame, "Gap V [mm]", "0.5", 2)
 
-        # Advanced variables are shared by the Gaps dialog.
+        # Mode: gap | no gap
+        ttk.Label(frame, text="Mode").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.gap_type = tk.StringVar(value=GapType.GAP.value)
-        self.gap_mode = tk.StringVar(value=GapSurfaceMode.SURFACE.value)
-        self.gap_size_z = tk.StringVar(value="0.0")
+        mode_box = ttk.Combobox(
+            frame,
+            textvariable=self.gap_type,
+            values=[GapType.GAP.value, GapType.NO_GAP.value],
+            state="readonly",
+            width=16,
+        )
+        mode_box.grid(row=0, column=1, sticky=tk.W, padx=4, pady=2)
+        mode_box.bind("<<ComboboxSelected>>", lambda e: self._sync_gap_mode_options())
 
-        ttk.Button(
-            tab,
-            text="Gap Settings…",
-            command=self._open_gap_dialog,
-        ).pack(anchor=tk.W, pady=(12, 0))
+        # Sub-mode depends on gap vs no gap
+        ttk.Label(frame, text="Option").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.gap_mode = tk.StringVar(value=GapSurfaceMode.SURFACE.value)
+        self.gap_option_box = ttk.Combobox(
+            frame,
+            textvariable=self.gap_mode,
+            values=[
+                GapSurfaceMode.EMPTY.value,
+                GapSurfaceMode.SURFACE.value,
+            ],
+            state="readonly",
+            width=16,
+        )
+        self.gap_option_box.grid(row=1, column=1, sticky=tk.W, padx=4, pady=2)
+
+        self.gap_u = self._add_entry(frame, "Size U / gap [mm]", "0.2", 2)
+        self.gap_v = self._add_entry(frame, "Size V / gap [mm]", "0.2", 3)
+
+        # kept for _collect compatibility (step-back disabled in simplified UI)
+        self.gap_enable = tk.BooleanVar(value=True)
+        self.gap_size_z = tk.StringVar(value="0.0")
 
         ttk.Label(
             tab,
-            text="Gap Settings contains gap type, surface mode, and step-back Z. "
-                 "Gap size is strictly derived from gap / (2 × facet size).",
-            wraplength=620,
-        ).pack(fill=tk.X, pady=(8, 0))
+            text=(
+                "Mode = gap: Option = empty | surface. "
+                "Deltas include gap — middle facet optical size = delta − gap, "
+                "edge facet = delta − gap/2.\n"
+                "Mode = no gap: Option = new border | old border | average "
+                "(shared edge is forced to match; no physical gap)."
+            ),
+            wraplength=660,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(10, 0))
+
+        self._sync_gap_mode_options()
+
+    def _sync_gap_mode_options(self) -> None:
+        """Swap Option list according to gap / no gap (LucidShape)."""
+        if self.gap_type.get() == GapType.NO_GAP.value:
+            opts = [
+                GapSurfaceMode.NEW_BORDER.value,
+                GapSurfaceMode.OLD_BORDER.value,
+                GapSurfaceMode.AVERAGE.value,
+            ]
+            default = GapSurfaceMode.NEW_BORDER.value
+        else:
+            opts = [
+                GapSurfaceMode.EMPTY.value,
+                GapSurfaceMode.SURFACE.value,
+            ]
+            default = GapSurfaceMode.SURFACE.value
+        self.gap_option_box["values"] = opts
+        if self.gap_mode.get() not in opts:
+            self.gap_mode.set(default)
 
     def _build_solver_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=10)
@@ -191,7 +271,7 @@ class MFReflectorApp:
             frame,
             "Patch fit method",
             [m.value for m in PatchFitMethod],
-            PatchFitMethod.EXACT.value,
+            PatchFitMethod.APPROXIMATE.value,
             0,
         )
         self.fit_patches_u = self._add_entry(frame, "# Fit patches U", "1", 1)
@@ -227,13 +307,13 @@ class MFReflectorApp:
         self.spread_h = self._add_entry(
             frame,
             "H angles [°] per facet (e.g. -20,20)",
-            "-20,-10,0,10,20",
+            "-20,20",
             0,
         )
         self.spread_v = self._add_entry(
             frame,
             "V angles [°] per facet (e.g. -5,5)",
-            "-10,-5,0,5,10",
+            "-10,10",
             1,
         )
         self.edge_ray = self._add_combobox(
@@ -413,12 +493,27 @@ class MFReflectorApp:
             self.btn_catia.config(state=tk.DISABLED)
 
     # ------------------------------------------------------------------ Data
+    @staticmethod
+    def _parse_deltas(text: str, n: int, fallback: float = 10.0) -> list:
+        """Parse '10,10,10,10' → list of length n (pad/truncate as needed)."""
+        parts = [p.strip() for p in str(text).replace(";", ",").split(",") if p.strip()]
+        vals = [float(p) for p in parts] if parts else []
+        if not vals:
+            vals = [fallback]
+        if len(vals) < n:
+            vals = vals + [vals[-1]] * (n - len(vals))
+        return vals[:n]
+
     def _collect(self) -> MFReflector:
         n_u = max(1, int(self.n_u.get()))
         n_v = max(1, int(self.n_v.get()))
-        size_u = float(self.size_u.get())
-        size_v = float(self.size_v.get())
-        degree = max(1, int(self.degree.get()))
+        degree_u = max(1, int(self.degree_u.get()))
+        degree_v = max(1, int(self.degree_v.get()))
+        width_deltas = self._parse_deltas(self.width_deltas.get(), n_u)
+        height_deltas = self._parse_deltas(self.height_deltas.get(), n_v)
+        offset_x = float(self.offset_x.get())
+        offset_y = float(self.offset_y.get())
+        start_z = float(self.start_z.get())
 
         calculation_start_u = (
             None
@@ -431,11 +526,7 @@ class MFReflectorApp:
             else float(self.calc_start_v.get())
         )
         gap_type = GapType(self.gap_type.get())
-        step_z = (
-            float(self.gap_size_z.get())
-            if gap_type in (GapType.STEP_BACK, GapType.STEP_BACK_NO_GAP)
-            else 0.0
-        )
+        step_z = 0.0
 
         return MFReflector(
             name="UI_Reflector",
@@ -445,18 +536,19 @@ class MFReflectorApp:
             grid=GridLayout(
                 n_u=n_u,
                 n_v=n_v,
-                width_deltas=[size_u / n_u] * n_u,
-                height_deltas=[size_v / n_v] * n_v,
-                offset_x=-size_u / 2.0,
-                offset_y=-size_v / 2.0,
+                width_deltas=width_deltas,
+                height_deltas=height_deltas,
+                offset_x=offset_x,
+                offset_y=offset_y,
+                start_z=start_z,
                 focal=float(self.focal.get()),
-                degree_u=degree,
-                degree_v=degree,
+                degree_u=degree_u,
+                degree_v=degree_v,
                 use_start_point=self.use_start_point.get(),
                 start_point=np.array([float(self.start_x.get()), float(self.start_y.get())]),
             ),
             gaps=GapsConfig(
-                enabled=self.gap_enable.get(),
+                enabled=True,
                 gap_type=gap_type,
                 surface_mode=GapSurfaceMode(self.gap_mode.get()),
                 size_u=float(self.gap_u.get()),
