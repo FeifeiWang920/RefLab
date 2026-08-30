@@ -47,7 +47,11 @@ class MFReflector:
     calculation_start_v: float | None = None
     reference_position_u: float = 0.0
     reference_position_v: float = 0.0
-    use_base_curve_from_neighbor: bool = True
+    # False (default): connect to the neighbour rigidly at the reference
+    # position — the facet keeps its exact optical design (spread = set range).
+    # True: force the full shared-edge curve to match the neighbour; edges are
+    # watertight (C0) but each facet's optics are bent near that border.
+    use_base_curve_from_neighbor: bool = False
     z_step_u: float = 0.0
     z_step_v: float = 0.0
 

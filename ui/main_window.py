@@ -225,7 +225,7 @@ class MFReflectorApp:
 
         frame = ttk.LabelFrame(tab, text="Numerical Solver", padding=8)
         frame.pack(fill=tk.X)
-        self.samples = self._add_entry(frame, "Samples per facet edge", "6", 0)
+        self.samples = self._add_entry(frame, "Samples per facet edge", "9", 0)
         self.solve = self._add_combobox(
             frame,
             "Solve order",
@@ -245,7 +245,7 @@ class MFReflectorApp:
         self.calc_start_v = tk.StringVar(value="0.0")
         self.reference_u = tk.StringVar(value="0.0")
         self.reference_v = tk.StringVar(value="0.0")
-        self.use_neighbor_curve = tk.BooleanVar(value=True)
+        self.use_neighbor_curve = tk.BooleanVar(value=False)
         self.z_step_u = tk.StringVar(value="0.0")
         self.z_step_v = tk.StringVar(value="0.0")
 
@@ -476,6 +476,15 @@ class MFReflectorApp:
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
         self._add_entry(neighbor_group, "Z step U [mm]", self.z_step_u.get(), 1, 18)
         self._add_entry(neighbor_group, "Z step V [mm]", self.z_step_v.get(), 2, 18)
+        ttk.Label(
+            neighbor_group,
+            text="Off: facets keep their exact optical spread and connect only at "
+                 "the reference point (recommended — spot range = settings).\n"
+                 "On: the shared edge curve is forced identical (watertight), but "
+                 "the facet optics bend near that border.",
+            wraplength=430,
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(14, 0))

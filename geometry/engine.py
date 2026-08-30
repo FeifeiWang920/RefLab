@@ -8,7 +8,7 @@ MacroFocal geometry engine (v0.8 – per-facet solver + Gap Surface).
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from models.reflector import MFReflector
@@ -123,13 +123,25 @@ def _integrate_relative(
                 z_rel[j, i] = z_rel[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
     return z_carrier + z_rel
 
-def _solve_order(n_u: int, n_v: int, start: Tuple[int, int], order: SolveMethod) -> List[Tuple[int, int]]:
+def _solve_order(n_u: int, n_v: int, start: Tuple[int, int], order: SolveMethod) -> Tuple[
+    List[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]]
+]:
+    """
+    BFS solve order plus the BFS parent of every facet.
+
+    The parent is guaranteed to be solved before its child (BFS property), so
+    each facet can always be matched against an already-computed neighbour.
+    This removes the old behaviour where facets whose candidate neighbours had
+    not been solved yet silently snapped back to the carrier, which produced an
+    independent "anchor patchwork" with mismatched facet borders.
+    """
     neighbors = (
         [(0, -1), (0, 1), (-1, 0), (1, 0)]
         if order == SolveMethod.V_FIRST
         else [(-1, 0), (1, 0), (0, -1), (0, 1)]
     )
     result: List[Tuple[int, int]] = []
+    parents: Dict[Tuple[int, int], Tuple[int, int]] = {}
     visited = {start}
     queue = [start]
     while queue:
@@ -139,8 +151,9 @@ def _solve_order(n_u: int, n_v: int, start: Tuple[int, int], order: SolveMethod)
             nxt = (iu + du, iv + dv)
             if 0 <= nxt[0] < n_u and 0 <= nxt[1] < n_v and nxt not in visited:
                 visited.add(nxt)
+                parents[nxt] = (iu, iv)
                 queue.append(nxt)
-    return result
+    return result, parents
 
 
 def _start_facet(reflector: MFReflector) -> Tuple[int, int, float, float]:
@@ -219,98 +232,61 @@ def _reconstruct_height_from_slopes(
     iterations: int = 40,
 ) -> np.ndarray:
     """
-    Build a smooth height field whose gradient matches (dzx, dzy) in LS sense.
+    Build the *optimal* height field whose gradient matches (dzx, dzy) in LS sense.
 
-    Discrete slope fields from the reflection law are generally *not* conservative
-    (path-dependent).  Naive row/column integration therefore leaves kinks.
-    We use Southwell-style iterative integration (average of successive
-    horizontal and vertical sweeps) which yields a much fairer surface while
-    still honouring the desired slopes.
+    Discrete slope fields from the reflection law are not exactly conservative
+    (path-dependent), so we solve the least-squares gradient-matching problem
+    directly (dense normal equations; per-facet grids are tiny):
+        min_z  sum_j,i ( (z[j,i+1]-z[j,i])/dx - dzx[j,i] )^2
+             + sum_j,i ( (z[j+1,i]-z[j,i])/dy - dzy[j,i] )^2
+    subject to z[seed] = z_seed.  This yields the smoothest surface that best
+    honours the desired slopes and replaces the old ad-hoc Southwell sweeps.
     """
     nv, nu = dzx.shape
+    N = nv * nu
     xs = np.asarray(x_coords, dtype=float)
     ys = np.asarray(y_coords, dtype=float)
-    z = np.zeros((nv, nu), dtype=float)
 
-    def sweep_from_seed(z0: np.ndarray) -> np.ndarray:
-        out = z0.copy()
-        # horizontal through seed row
-        j = seed_j
-        for i in range(seed_i + 1, nu):
-            dx = xs[i] - xs[i - 1]
-            out[j, i] = out[j, i - 1] + 0.5 * (dzx[j, i] + dzx[j, i - 1]) * dx
-        for i in range(seed_i - 1, -1, -1):
-            dx = xs[i] - xs[i + 1]
-            out[j, i] = out[j, i + 1] + 0.5 * (dzx[j, i] + dzx[j, i + 1]) * dx
-        # vertical through every column
+    n_eq = nv * (nu - 1) + (nv - 1) * nu
+    A = np.zeros((n_eq, N))
+    b = np.zeros(n_eq)
+    k = 0
+    for j in range(nv):
+        for i in range(nu - 1):
+            dx = xs[i + 1] - xs[i]
+            if dx <= 0.0:
+                continue
+            A[k, j * nu + i + 1] = 1.0 / dx
+            A[k, j * nu + i] = -1.0 / dx
+            b[k] = dzx[j, i]
+            k += 1
+    for j in range(nv - 1):
         for i in range(nu):
-            for j in range(seed_j + 1, nv):
-                dy = ys[j] - ys[j - 1]
-                out[j, i] = out[j - 1, i] + 0.5 * (dzy[j, i] + dzy[j - 1, i]) * dy
-            for j in range(seed_j - 1, -1, -1):
-                dy = ys[j] - ys[j + 1]
-                out[j, i] = out[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
-        return out
+            dy = ys[j + 1] - ys[j]
+            if dy <= 0.0:
+                continue
+            A[k, (j + 1) * nu + i] = 1.0 / dy
+            A[k, j * nu + i] = -1.0 / dy
+            b[k] = dzy[j, i]
+            k += 1
+    A = A[:k]
+    b = b[:k]
 
-    def sweep_v_first(z0: np.ndarray) -> np.ndarray:
-        out = z0.copy()
-        i = seed_i
-        for j in range(seed_j + 1, nv):
-            dy = ys[j] - ys[j - 1]
-            out[j, i] = out[j - 1, i] + 0.5 * (dzy[j, i] + dzy[j - 1, i]) * dy
-        for j in range(seed_j - 1, -1, -1):
-            dy = ys[j] - ys[j + 1]
-            out[j, i] = out[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
-        for j in range(nv):
-            for i in range(seed_i + 1, nu):
-                dx = xs[i] - xs[i - 1]
-                out[j, i] = out[j, i - 1] + 0.5 * (dzx[j, i] + dzx[j, i - 1]) * dx
-            for i in range(seed_i - 1, -1, -1):
-                dx = xs[i] - xs[i + 1]
-                out[j, i] = out[j, i + 1] + 0.5 * (dzx[j, i] + dzx[j, i + 1]) * dx
-        return out
-
-    z[seed_j, seed_i] = z_seed
-    z = 0.5 * (sweep_from_seed(z) + sweep_v_first(z))
-    z += z_seed - z[seed_j, seed_i]
-
-    # Iterative gradient matching (relax toward desired slopes)
-    for _ in range(max(1, iterations)):
-        # Estimate current discrete slopes
-        cx = np.zeros_like(z)
-        cy = np.zeros_like(z)
-        for j in range(nv):
-            for i in range(1, nu - 1):
-                cx[j, i] = (z[j, i + 1] - z[j, i - 1]) / (xs[i + 1] - xs[i - 1])
-            if nu > 1:
-                cx[j, 0] = (z[j, 1] - z[j, 0]) / (xs[1] - xs[0])
-                cx[j, -1] = (z[j, -1] - z[j, -2]) / (xs[-1] - xs[-2])
-        for i in range(nu):
-            for j in range(1, nv - 1):
-                cy[j, i] = (z[j + 1, i] - z[j - 1, i]) / (ys[j + 1] - ys[j - 1])
-            if nv > 1:
-                cy[0, i] = (z[1, i] - z[0, i]) / (ys[1] - ys[0])
-                cy[-1, i] = (z[-1, i] - z[-2, i]) / (ys[-1] - ys[-2])
-        # Residual and correct by a damped Poisson-like step
-        rx = dzx - cx
-        ry = dzy - cy
-        corr = np.zeros_like(z)
-        for j in range(1, nv - 1):
-            for i in range(1, nu - 1):
-                # integrate residual roughly
-                corr[j, i] = 0.25 * (
-                    (rx[j, i + 1] - rx[j, i - 1]) * 0.5 * (xs[i + 1] - xs[i - 1]) * 0.25
-                    + (ry[j + 1, i] - ry[j - 1, i]) * 0.5 * (ys[j + 1] - ys[j - 1]) * 0.25
-                )
-        z[1:-1, 1:-1] += 0.5 * corr[1:-1, 1:-1]
-        z += z_seed - z[seed_j, seed_i]
-
-    return z
+    # Fix the seed height (Dirichlet constraint): solve for the other nodes.
+    mask = np.ones(N, dtype=bool)
+    mask[seed_j * nu + seed_i] = False
+    Am = A[:, mask]
+    bm = b - (A[:, ~mask] * z_seed).ravel()
+    sol, *_ = np.linalg.lstsq(Am, bm, rcond=None)
+    z = np.zeros(N)
+    z[~mask] = z_seed
+    z[mask] = sol
+    return z.reshape(nv, nu)
 
 
 def _build_height_field(reflector: MFReflector):
     """
-    LucidShape-style ordered per-facet solve.
+    LucidShape-style per-facet solve with globally consistent borders.
 
     From FunGeo / MF dialog (Set F.Start, Other Settings):
       - patch calculation sequence: vertical-first or horizontal-first
@@ -318,13 +294,20 @@ def _build_height_field(reflector: MFReflector):
       - Each facet is integrated independently for its own spreads.
       - calculation start (U,V): seed of the relative integration inside
         the facet; default (0,0) or automatic = reference position.
-      - reference position (U,V) along the shared edge: controls how the
-        new facet connects to the already-computed neighbour.  We apply a
-        *rigid Z offset* so the surface at the reference point matches the
-        neighbour (preserves the optical shape of the new facet).
-      - optional use_base_curve_from_neighbor: match the full shared-edge
-        curve instead of a single reference point.
-      - Z steps: added per facet index after matching.
+      - reference position (U,V) along the shared edge: when
+        use_base_curve_from_neighbor is off, only the point at the reference
+        position of the already-computed parent facet is matched (rigid Z
+        offset, preserving the optical shape of the new facet).
+      - use_base_curve_from_neighbor (default): the new facet connects to its
+        neighbour along the *full* shared-edge curve.  We implement this as a
+        two-pass scheme:
+          1. every facet is solved absolutely (carrier-anchored);
+          2. the shared borders are averaged between the adjacent facets and
+             each facet is re-solved with those border curves as Dirichlet
+             boundary conditions.
+        This makes the whole facet family watertight (C0) at every shared
+        border — no banks, wrinkles or twisted step surfaces between facets.
+      - Z steps: added per facet index after the border match.
 
     Facets are intentionally *not* one C1 surface — gaps separate them.
     """
@@ -363,28 +346,27 @@ def _build_height_field(reflector: MFReflector):
     z_step_v = reflector.z_step_v + reflector.gaps.effective_step_z()
 
     start_iu, start_iv, start_local_u, start_local_v = _start_facet(reflector)
-    solve_order = _solve_order(n_u, n_v, (start_iu, start_iv), order)
+    solve_order, parents = _solve_order(n_u, n_v, (start_iu, start_iv), order)
 
-    # Store each solved facet block for neighbour lookup
-    solved: Dict[Tuple[int, int], np.ndarray] = {}
-
+    # ------------------------------------------------------------------
+    # Pass 1: independent optical solve of every facet (absolute heights,
+    # anchored to the carrier at the facet's calculation-start point).
+    # ------------------------------------------------------------------
+    abs_blocks: Dict[Tuple[int, int], np.ndarray] = {}
+    facet_seeds: Dict[Tuple[int, int], Tuple[int, int, float]] = {}
+    facet_grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
     for iu, iv in solve_order:
         i0 = iu * (su - 1)
         j0 = iv * (sv - 1)
         xs = x_coords[i0:i0 + su]
         ys = y_coords[j0:j0 + sv]
+        facet_grids[(iu, iv)] = (xs, ys)
 
         carrier = np.asarray(
             [[_carrier_z(xs[i], ys[j], source, focal) for i in range(su)]
              for j in range(sv)],
             dtype=float,
         )
-
-        def local_target(li: int, lj: int) -> np.ndarray:
-            lu = li / max(su - 1, 1)
-            lv = lj / max(sv - 1, 1)
-            h_deg, v_deg = spreads.target_angles_on_facet(iu, iv, lu, lv)
-            return _target_direction_from_angles(h_deg, v_deg)
 
         # --- calculation start (F.Start / auto = reference) ---
         is_seed_facet = (iu, iv) == (start_iu, start_iv)
@@ -403,88 +385,424 @@ def _build_height_field(reflector: MFReflector):
                 seed_v = float(reflector.reference_position_v)
         seed_i = int(np.clip(round(seed_u * (su - 1)), 0, su - 1))
         seed_j = int(np.clip(round(seed_v * (sv - 1)), 0, sv - 1))
+        # Height reference = carrier + grid.start_z at the calculation-start
+        # point (base plane).
+        z_ref = float(carrier[seed_j, seed_i]) + grid.start_z + grid.offset_z
+        facet_seeds[(iu, iv)] = (seed_i, seed_j, z_ref)
 
-        # --- independent optical integration on this facet ---
-        # Desired *absolute* slopes from reflection law (on carrier seed), then
-        # reconstruct a fair height field (Southwell) so the facet is smooth.
-        z_loc = carrier.copy()
-        for _ in range(max(1, int(reflector.solver_iterations))):
-            dzx_abs = np.zeros((sv, su))
-            dzy_abs = np.zeros((sv, su))
-            for lj in range(sv):
-                for li in range(su):
-                    pt = np.array([xs[li], ys[lj], z_loc[lj, li]])
-                    n_req = _required_normal(source, pt, local_target(li, lj))
-                    sx, sy = _slopes_from_normal(n_req)
-                    dzx_abs[lj, li] = sx
-                    dzy_abs[lj, li] = sy
-            z_new = _reconstruct_height_from_slopes(
-                dzx_abs, dzy_abs, xs, ys,
-                z_seed=float(carrier[seed_j, seed_i]),
-                seed_i=seed_i, seed_j=seed_j,
-                iterations=30,
-            )
-            delta = float(np.max(np.abs(z_new - z_loc)))
-            z_loc = z_new
-            if delta <= max(0.0, float(reflector.solver_tolerance)):
-                break
+        # Desired *absolute* slopes from the reflection law, then reconstruct a
+        # height field by least-squares gradient matching so the facet's
+        # reflection angles follow the spread.
+        def raw_target(li: int, lj: int, iu=iu, iv=iv) -> Tuple[float, float]:
+            lu = li / max(su - 1, 1)
+            lv = lj / max(sv - 1, 1)
+            return spreads.target_angles_on_facet(iu, iv, lu, lv)
 
-        # --- neighbour influence: rigid offset (and optional edge curve) ---
-        if not solved:
-            # First facet: absolute height from carrier + grid offsets
-            ref_z = carrier[seed_j, seed_i] + grid.start_z + grid.offset_z
-            z_loc += ref_z - z_loc[seed_j, seed_i]
-        else:
-            # Prefer neighbour consistent with path calculation sequence
-            candidates = (
-                [(iu, iv - 1), (iu - 1, iv)]
-                if order == SolveMethod.V_FIRST
-                else [(iu - 1, iv), (iu, iv - 1)]
+        abs_blocks[(iu, iv)] = _solve_facet_optical(
+            reflector, xs, ys, source, raw_target, su, sv,
+            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j, z_init=carrier,
+        )
+
+    # ------------------------------------------------------------------
+    # Pass 2: spread calibration (one affine round).
+    # The least-squares surface reproduces the requested spread only to the
+    # discretisation accuracy (~1-3° at facet borders).  Measure the affine
+    # deviation  realised ≈ a + b·target  on each facet and re-solve with the
+    # corrected target mapping, so the realised far-field extent of every facet
+    # matches the requested angle range (rectangular spot).
+    # ------------------------------------------------------------------
+    calib = _calibrate_facets(abs_blocks, facet_grids, source, spreads, su, sv)
+    cal_blocks: Dict[Tuple[int, int], np.ndarray] = {}
+    for iu, iv in solve_order:
+        xs, ys = facet_grids[(iu, iv)]
+        seed_i, seed_j, z_ref = facet_seeds[(iu, iv)]
+        ah, bh, av, bv = calib[(iu, iv)]
+
+        def cal_target(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
+                       iu=iu, iv=iv) -> Tuple[float, float]:
+            h_deg, v_deg = spreads.target_angles_on_facet(
+                iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
             )
-            matched = False
-            for niu, niv in candidates:
-                if (niu, niv) not in solved:
-                    continue
-                neigh = solved[(niu, niv)]
-                # Shared edge: neighbour right/top vs this left/bottom
-                if niu == iu - 1 and niv == iv:
-                    # shared vertical edge: neigh[:, -1] vs z_loc[:, 0]
+            return (h_deg - ah) / bh, (v_deg - av) / bv
+
+        cal_blocks[(iu, iv)] = _solve_facet_optical(
+            reflector, xs, ys, source, cal_target, su, sv,
+            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
+            z_init=abs_blocks[(iu, iv)],
+        )
+
+    # ------------------------------------------------------------------
+    # Pass 3: neighbour influence.
+    # ------------------------------------------------------------------
+    blocks: Dict[Tuple[int, int], np.ndarray] = {}
+    if reflector.use_base_curve_from_neighbor:
+        # Optional full shared-edge curve matching: average the facing edge
+        # curves of adjacent facets, then re-solve each facet with those
+        # curves as Dirichlet boundary conditions -> C0 borders.  NOTE: this
+        # bends the facet optics near every shared border (the two designs
+        # demand opposite edge slopes), so the far-field range is only
+        # approximate; the reference-point mode below is the optical default.
+        border_curves = _shared_border_curves(cal_blocks, su, sv)
+        for iu, iv in solve_order:
+            i0 = iu * (su - 1)
+            j0 = iv * (sv - 1)
+            xs = x_coords[i0:i0 + su]
+            ys = y_coords[j0:j0 + sv]
+            zb = {
+                "left": border_curves[("u", iu, iv)] if iu > 0 else None,
+                "right": border_curves[("u", iu + 1, iv)] if iu < n_u - 1 else None,
+                "bottom": border_curves[("v", iu, iv)] if iv > 0 else None,
+                "top": border_curves[("v", iu, iv + 1)] if iv < n_v - 1 else None,
+            }
+            ah, bh, av, bv = calib[(iu, iv)]
+
+            def cal_target2(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
+                            iu=iu, iv=iv) -> Tuple[float, float]:
+                h_deg, v_deg = spreads.target_angles_on_facet(
+                    iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
+                )
+                return (h_deg - ah) / bh, (v_deg - av) / bv
+
+            blk = _solve_facet_with_borders(
+                reflector, cal_blocks[(iu, iv)], spread_target=cal_target2,
+                xs=xs, ys=ys, source=source, zb=zb,
+                su=su, sv=sv, z_step=float(iu * z_step_u + iv * z_step_v),
+            )
+            blocks[(iu, iv)] = blk
+            z[j0:j0 + sv, i0:i0 + su] = blk
+    else:
+        # Reference-position rigid offset against the BFS parent (the parent
+        # is always already solved, so the old "snap to carrier" patchwork is
+        # gone).  A Z step is added per facet index afterwards.
+        solved: Dict[Tuple[int, int], np.ndarray] = {}
+        for iu, iv in solve_order:
+            i0 = iu * (su - 1)
+            j0 = iv * (sv - 1)
+            xs = x_coords[i0:i0 + su]
+            ys = y_coords[j0:j0 + sv]
+            z_loc = cal_blocks[(iu, iv)].copy()
+            parent = parents.get((iu, iv))
+            if parent is not None:
+                piu, piv = parent
+                neigh = solved[(piu, piv)]
+                if piu == iu - 1:
                     ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
                     idx = int(round(ref * (sv - 1)))
-                    if reflector.use_base_curve_from_neighbor:
-                        # match full edge curve with rigid-ish average offset
-                        # (single scalar keeps optical shape; curve match via mean)
-                        offset = float(np.mean(neigh[:, -1] - z_loc[:, 0]))
-                    else:
-                        offset = float(neigh[idx, -1] - z_loc[idx, 0])
-                    z_loc += offset
-                    matched = True
-                elif niu == iu and niv == iv - 1:
-                    # shared horizontal edge: neigh[-1, :] vs z_loc[0, :]
+                    z_loc += float(neigh[idx, -1] - z_loc[idx, 0])
+                elif piu == iu + 1:
+                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
+                    idx = int(round(ref * (sv - 1)))
+                    z_loc += float(neigh[idx, 0] - z_loc[idx, -1])
+                elif piv == iv - 1:
                     ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
                     idx = int(round(ref * (su - 1)))
-                    if reflector.use_base_curve_from_neighbor:
-                        offset = float(np.mean(neigh[-1, :] - z_loc[0, :]))
-                    else:
-                        offset = float(neigh[-1, idx] - z_loc[0, idx])
-                    z_loc += offset
-                    matched = True
-                if matched:
-                    break
-            if not matched:
-                ref_z = carrier[seed_j, seed_i] + grid.start_z + grid.offset_z
-                z_loc += ref_z - z_loc[seed_j, seed_i]
+                    z_loc += float(neigh[-1, idx] - z_loc[0, idx])
+                elif piv == iv + 1:
+                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
+                    idx = int(round(ref * (su - 1)))
+                    z_loc += float(neigh[0, idx] - z_loc[-1, idx])
+            z_loc = z_loc + (iu * z_step_u + iv * z_step_v)
+            solved[(iu, iv)] = z_loc.copy()
+            blocks[(iu, iv)] = z_loc.copy()
+            z[j0:j0 + sv, i0:i0 + su] = z_loc
 
-        # Z step for this facet index
-        z_loc = z_loc + (iu * z_step_u + iv * z_step_v)
+    return x_coords, y_coords, z, su, sv, blocks
 
-        # Fair interior to reduce curvature spikes (boundary fixed)
-        z_loc = _fair_height_block(z_loc, iterations=8, strength=0.35)
 
-        solved[(iu, iv)] = z_loc.copy()
-        z[j0:j0 + sv, i0:i0 + su] = z_loc
+# ---------------------------------------------------------------------------
+# Per-facet optical solve + spread calibration
+# ---------------------------------------------------------------------------
 
-    return x_coords, y_coords, z, su, sv
+
+def _solve_facet_optical(
+    reflector: MFReflector,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    target_fn,
+    su: int,
+    sv: int,
+    z_seed: float,
+    seed_i: int,
+    seed_j: int,
+    z_init: np.ndarray,
+) -> np.ndarray:
+    """
+    Fixed-point solve of one facet: at every node take the reflection-law
+    normal for the spread target, integrate the slope field by least-squares
+    gradient matching, and iterate until the surface stops moving.
+    """
+    max_iter = max(1, int(reflector.solver_iterations))
+    tol = max(0.0, float(reflector.solver_tolerance))
+    z_loc = np.asarray(z_init, dtype=float).copy()
+    for _ in range(max_iter):
+        dzx = np.zeros((sv, su))
+        dzy = np.zeros((sv, su))
+        for lj in range(sv):
+            for li in range(su):
+                pt = np.array([xs[li], ys[lj], z_loc[lj, li]])
+                h_deg, v_deg = target_fn(li, lj)
+                n_req = _required_normal(
+                    source, pt, _target_direction_from_angles(h_deg, v_deg)
+                )
+                sx, sy = _slopes_from_normal(n_req)
+                dzx[lj, li] = sx
+                dzy[lj, li] = sy
+        z_new = _reconstruct_height_from_slopes(
+            dzx, dzy, xs, ys,
+            z_seed=z_seed,
+            seed_i=seed_i, seed_j=seed_j,
+            iterations=30,
+        )
+        delta = float(np.max(np.abs(z_new - z_loc)))
+        z_loc = z_new
+        if delta <= tol:
+            break
+    return z_loc
+
+
+def _realized_angles_on_block(
+    blk: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reflected (h, v) deg at every node of a height-field block."""
+    sv, su = blk.shape
+    hs = np.zeros((sv, su))
+    vs = np.zeros((sv, su))
+    for j in range(sv):
+        for i in range(su):
+            if 0 < i < su - 1:
+                zx = (blk[j, i + 1] - blk[j, i - 1]) / (xs[i + 1] - xs[i - 1])
+            elif i == 0:
+                zx = (blk[j, 1] - blk[j, 0]) / (xs[1] - xs[0])
+            else:
+                zx = (blk[j, -1] - blk[j, -2]) / (xs[-1] - xs[-2])
+            if 0 < j < sv - 1:
+                zy = (blk[j + 1, i] - blk[j - 1, i]) / (ys[j + 1] - ys[j - 1])
+            elif j == 0:
+                zy = (blk[1, i] - blk[0, i]) / (ys[1] - ys[0])
+            else:
+                zy = (blk[-1, i] - blk[-2, i]) / (ys[-1] - ys[-2])
+            n = np.array([-zx, -zy, 1.0])
+            ln = np.linalg.norm(n)
+            if ln < 1e-14:
+                continue
+            n /= ln
+            p = np.array([xs[i], ys[j], blk[j, i]])
+            I = p - source
+            I /= np.linalg.norm(I)
+            R = I - 2.0 * np.dot(I, n) * n
+            R /= np.linalg.norm(R)
+            hs[j, i] = np.rad2deg(np.arctan2(R[0], R[2]))
+            vs[j, i] = np.rad2deg(np.arcsin(np.clip(R[1], -1.0, 1.0)))
+    return hs, vs
+
+
+def _calibrate_facets(
+    blocks: Dict[Tuple[int, int], np.ndarray],
+    grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]],
+    source: np.ndarray,
+    spreads,
+    su: int,
+    sv: int,
+) -> Dict[Tuple[int, int], Tuple[float, float, float, float]]:
+    """
+    Per-facet affine calibration of the spread mapping.
+
+    realized_h ≈ ah + bh·target_h   and   realized_v ≈ av + bv·target_v
+    are fitted at the nodes of the pass-1 solution.  The corrected target map
+    (h-ah)/bh, (v-av)/bv makes the realised far-field extent of the facet equal
+    the requested angle range (rectangular spot).
+    """
+    calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
+    for key, blk in blocks.items():
+        xs, ys = grids[key]
+        th, tv = [], []
+        rh, rv = [], []
+        for j in range(1, sv - 1):
+            for i in range(1, su - 1):
+                h_, v_ = spreads.target_angles_on_facet(
+                    key[0], key[1], i / max(su - 1, 1), j / max(sv - 1, 1)
+                )
+                th.append(h_)
+                tv.append(v_)
+        hs, vs = _realized_angles_on_block(blk, xs, ys, source)
+        for j in range(1, sv - 1):
+            for i in range(1, su - 1):
+                rh.append(hs[j, i])
+                rv.append(vs[j, i])
+        th, tv, rh, rv = map(np.asarray, (th, tv, rh, rv))
+
+        def fit(target, realized):
+            if float(np.ptp(target)) < 1e-6:
+                return 0.0, 1.0
+            slope, intercept = np.polyfit(target, realized, 1)
+            slope = float(np.clip(slope, 0.5, 1.5))
+            return float(intercept), slope
+
+        ah, bh = fit(th, rh)
+        av, bv = fit(tv, rv)
+        calib[key] = (ah, bh, av, bv)
+    return calib
+
+
+def _shared_border_curves(
+    blocks: Dict[Tuple[int, int], np.ndarray], su: int, sv: int
+) -> Dict[Tuple[str, int, int], np.ndarray]:
+    """
+    Build one consistent curve per internal border by averaging the facing
+    edges of the adjacent facets, with grid corners averaged over all facets
+    sharing them.  Keys: ("u", iu_border, iv) for a vertical border at
+    x_edges[iu_border] (0 < iu_border < n_u), and ("v", iu, iv_border) for a
+    horizontal border at y_edges[iv_border] (0 < iv_border < n_v).
+    """
+    n_u = max(b[0] for b in blocks) + 1
+    n_v = max(b[1] for b in blocks) + 1
+    corners: Dict[Tuple[int, int], List[np.ndarray]] = {}
+    for (iu, iv), blk in blocks.items():
+        for ci, (di, dj) in enumerate(((0, 0), (su - 1, 0), (su - 1, sv - 1), (0, sv - 1))):
+            key = (iu + (1 if di == su - 1 else 0), iv + (1 if dj == sv - 1 else 0))
+            corners.setdefault(key, []).append(blk[dj, di])
+    corner_val = {k: np.mean(np.asarray(v), axis=0) for k, v in corners.items()}
+
+    curves: Dict[Tuple[str, int, int], np.ndarray] = {}
+    for iu in range(1, n_u):
+        for iv in range(n_v):
+            a = blocks[(iu - 1, iv)]
+            b = blocks[(iu, iv)]
+            curve = 0.5 * (a[:, -1] + b[:, 0])
+            curve[0] = corner_val[(iu, iv)]
+            curve[-1] = corner_val[(iu, iv + 1)]
+            curves[("u", iu, iv)] = curve
+    for iv in range(1, n_v):
+        for iu in range(n_u):
+            a = blocks[(iu, iv - 1)]
+            b = blocks[(iu, iv)]
+            curve = 0.5 * (a[-1, :] + b[0, :])
+            curve[0] = corner_val[(iu, iv)]
+            curve[-1] = corner_val[(iu + 1, iv)]
+            curves[("v", iu, iv)] = curve
+    return curves
+
+
+def _ls_reconstruct_with_borders(
+    dzx: np.ndarray,
+    dzy: np.ndarray,
+    x_coords: Sequence[float],
+    y_coords: Sequence[float],
+    z_borders: Dict[str, Optional[np.ndarray]],
+) -> np.ndarray:
+    """Least-squares gradient matching with Dirichlet border rows/columns."""
+    nv, nu = dzx.shape
+    N = nv * nu
+    xs = np.asarray(x_coords, dtype=float)
+    ys = np.asarray(y_coords, dtype=float)
+
+    n_eq = nv * (nu - 1) + (nv - 1) * nu
+    A = np.zeros((n_eq, N))
+    b = np.zeros(n_eq)
+    k = 0
+    for j in range(nv):
+        for i in range(nu - 1):
+            dx = xs[i + 1] - xs[i]
+            if dx <= 0.0:
+                continue
+            A[k, j * nu + i + 1] = 1.0 / dx
+            A[k, j * nu + i] = -1.0 / dx
+            b[k] = dzx[j, i]
+            k += 1
+    for j in range(nv - 1):
+        for i in range(nu):
+            dy = ys[j + 1] - ys[j]
+            if dy <= 0.0:
+                continue
+            A[k, (j + 1) * nu + i] = 1.0 / dy
+            A[k, j * nu + i] = -1.0 / dy
+            b[k] = dzy[j, i]
+            k += 1
+    A = A[:k]
+    b = b[:k]
+
+    z_fixed = np.zeros(N)
+    fixed = np.zeros(N, dtype=bool)
+    for side, arr in z_borders.items():
+        if arr is None:
+            continue
+        arr = np.asarray(arr, dtype=float)
+        if side in ("left", "right"):
+            idx = 0 if side == "left" else nu - 1
+            for j in range(nv):
+                z_fixed[j * nu + idx] = arr[j]
+                fixed[j * nu + idx] = True
+        else:
+            idx = 0 if side == "bottom" else nv - 1
+            for i in range(nu):
+                z_fixed[idx * nu + i] = arr[i]
+                fixed[idx * nu + i] = True
+
+    free = ~fixed
+    if not free.any():
+        return z_fixed.reshape(nv, nu)
+
+    Am = A[:, free]
+    bm = b - (A[:, fixed] @ z_fixed[fixed])
+    sol, *_ = np.linalg.lstsq(Am, bm, rcond=None)
+    z = np.zeros(N)
+    z[fixed] = z_fixed[fixed]
+    z[free] = sol
+    return z.reshape(nv, nu)
+
+
+def _solve_facet_with_borders(
+    reflector: MFReflector,
+    ref_block,
+    spread_target,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    zb: Dict[str, Optional[np.ndarray]],
+    su: int,
+    sv: int,
+    z_step: float,
+) -> np.ndarray:
+    """Fixed-point solve of one facet with fixed border curves (+ z step)."""
+    max_iter = max(1, int(reflector.solver_iterations))
+    tol = max(0.0, float(reflector.solver_tolerance))
+    if all(arr is None for arr in zb.values()):
+        # Single-facet reflector (or fully free borders): nothing to stitch —
+        # keep the absolute pass-1 solution, only add the Z step.
+        return np.asarray(ref_block, dtype=float) + z_step
+    # Initial guess: the pass-1 block (its borders are replaced by zb below).
+    z_loc = np.asarray(ref_block, dtype=float).copy()
+    for side, arr in zb.items():
+        if arr is None:
+            continue
+        arr = np.asarray(arr, dtype=float)
+        if side in ("left", "right"):
+            idx = 0 if side == "left" else su - 1
+            z_loc[:, idx] = arr
+        else:
+            idx = 0 if side == "bottom" else sv - 1
+            z_loc[idx, :] = arr
+    for _ in range(max_iter):
+        dzx = np.zeros((sv, su))
+        dzy = np.zeros((sv, su))
+        for lj in range(sv):
+            for li in range(su):
+                pt = np.array([xs[li], ys[lj], z_loc[lj, li]])
+                h_deg, v_deg = spread_target(li, lj)
+                n_req = _required_normal(source, pt, _target_direction_from_angles(h_deg, v_deg))
+                sx, sy = _slopes_from_normal(n_req)
+                dzx[lj, li] = sx
+                dzy[lj, li] = sy
+        z_new = _ls_reconstruct_with_borders(dzx, dzy, xs, ys, zb)
+        delta = float(np.max(np.abs(z_new - z_loc)))
+        z_loc = z_new
+        if delta <= tol:
+            break
+    return z_loc + z_step
 
 
 def _bilinear_sample(grid_pts: np.ndarray, u: float, v: float) -> np.ndarray:
@@ -1112,14 +1430,7 @@ def generate_facets(
 
     n_u, n_v = grid.n_u, grid.n_v
     degree_u, degree_v = grid.degree_u, grid.degree_v
-    x_coords, y_coords, z, su_g, sv_g = _build_height_field(reflector)
-    nodes = np.asarray(
-        [
-            [[x_coords[i], y_coords[j], z[j, i]] for i in range(len(x_coords))]
-            for j in range(len(y_coords))
-        ],
-        dtype=float,
-    )
+    x_coords, y_coords, z, su_g, sv_g, blocks = _build_height_field(reflector)
     step_u = su_g - 1
     step_v = sv_g - 1
 
@@ -1141,10 +1452,18 @@ def generate_facets(
 
     for iv in range(n_v):
         for iu in range(n_u):
-            sub = nodes[
-                iv * step_v:(iv + 1) * step_v + 1,
-                iu * step_u:(iu + 1) * step_u + 1,
-            ].copy()
+            # Sample this facet from its own solved block: neighbours share
+            # border columns in the full z array, and the last solver would
+            # overwrite them.  Using the per-facet block keeps every facet's
+            # sample grid consistent with its own solution.
+            blk = blocks[(iu, iv)]
+            xs_b = x_coords[iu * step_u:(iu + 1) * step_u + 1]
+            ys_b = y_coords[iv * step_v:(iv + 1) * step_v + 1]
+            sub = np.asarray(
+                [[[xs_b[i], ys_b[j], blk[j, i]] for i in range(su)]
+                 for j in range(sv)],
+                dtype=float,
+            )
             width = grid.width_deltas[iu]
             height = grid.height_deltas[iv]
             # deltas include gap: internal side loses gap/2, outer side loses 0

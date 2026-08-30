@@ -49,7 +49,7 @@ def test_tabbed_ui_and_dialogs():
     assert reflector.fit_patch_continuity_u == PatchContinuity.POINT
     assert reflector.calculation_start_u is None
     assert reflector.calculation_start_v is None
-    assert reflector.use_base_curve_from_neighbor is True
+    assert reflector.use_base_curve_from_neighbor is False
     assert reflector.z_step_u == 0.0
     assert reflector.z_step_v == 0.0
 
