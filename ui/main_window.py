@@ -225,7 +225,7 @@ class MFReflectorApp:
 
         frame = ttk.LabelFrame(tab, text="Numerical Solver", padding=8)
         frame.pack(fill=tk.X)
-        self.samples = self._add_entry(frame, "Samples per facet edge", "9", 0)
+        self.samples = self._add_entry(frame, "Samples per facet edge", "15", 0)
         self.solve = self._add_combobox(
             frame,
             "Solve order",

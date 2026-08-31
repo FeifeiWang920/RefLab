@@ -452,22 +452,33 @@ def _build_height_field(reflector: MFReflector):
             z_init=cal_blocks[(iu, iv)],
         )
     cal_blocks = new_blocks
+
+    # ------------------------------------------------------------------
+    # Pass 2b: separable 1-D inverse map for H(u) and V(v).
+    # Affine calibration only matches the four edge *means*.  On an
+    # off-axis facet the integrable projection dumps most of +V into a
+    # one-row strip at the top; after NURBS that strip is gone and the
+    # far-field stops around +6° while -V still reaches -10°.
+    # Invert the measured mid-line maps so interior nodes request the
+    # +V that the projection would otherwise swallow.
+    # ------------------------------------------------------------------
+    inv_blocks: Dict[Tuple[int, int], np.ndarray] = {}
     residual_targets: Dict[Tuple[int, int], object] = {}
     for iu, iv in solve_order:
+        xs, ys = facet_grids[(iu, iv)]
+        seed_i, seed_j, z_ref = facet_seeds[(iu, iv)]
         a1, b1, a2, b2 = acc_calib[(iu, iv)]
-
-        def fn(li: int, lj: int, a1=a1, b1=b1, a2=a2, b2=b2,
-               iu=iu, iv=iv) -> Tuple[float, float]:
-            h_deg, v_deg = spreads.target_angles_on_facet(
-                iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
-            )
-            if abs(b1) < 1e-6:
-                b1 = 1.0
-            if abs(b2) < 1e-6:
-                b2 = 1.0
-            return (h_deg - a1) / b1, (v_deg - a2) / b2
-
+        hs_r, vs_r = _realized_angles_on_block(cal_blocks[(iu, iv)], xs, ys, source)
+        fn = _separable_inverse_target(
+            iu, iv, su, sv, spreads, hs_r, vs_r, a1, b1, a2, b2, gain=0.85
+        )
+        inv_blocks[(iu, iv)] = _solve_facet_optical(
+            reflector, xs, ys, source, fn, su, sv,
+            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
+            z_init=cal_blocks[(iu, iv)],
+        )
         residual_targets[(iu, iv)] = fn
+    cal_blocks = inv_blocks
 
     # ------------------------------------------------------------------
     # Pass 3: neighbour influence.
@@ -899,6 +910,61 @@ def _make_residual_target(
 
     def fn(li: int, lj: int, ch=corr_h, cv=corr_v) -> Tuple[float, float]:
         return float(ch[lj, li]), float(cv[lj, li])
+
+    return fn
+
+
+def _separable_inverse_target(
+    iu: int,
+    iv: int,
+    su: int,
+    sv: int,
+    spreads,
+    realized_h: np.ndarray,
+    realized_v: np.ndarray,
+    a1: float,
+    b1: float,
+    a2: float,
+    b2: float,
+    gain: float = 0.85,
+):
+    """
+    Build H(u), V(v) asked-angle maps by inverting the measured
+    column-mean / row-mean realised angles.
+
+    asked(u) = affine(target(u)) + gain * (target(u) - realised_mean(u))
+    so interior nodes that currently undershoot +V request a larger V.
+    """
+    if abs(b1) < 1e-6:
+        b1 = 1.0
+    if abs(b2) < 1e-6:
+        b2 = 1.0
+
+    tgt_h = np.zeros(su)
+    tgt_v = np.zeros(sv)
+    for i in range(su):
+        tgt_h[i] = spreads.target_angles_on_facet(iu, iv, i / max(su - 1, 1), 0.5)[0]
+    for j in range(sv):
+        tgt_v[j] = spreads.target_angles_on_facet(iu, iv, 0.5, j / max(sv - 1, 1))[1]
+
+    # Mean realised profile (separable)
+    real_h = np.mean(realized_h, axis=0)
+    real_v = np.mean(realized_v, axis=1)
+
+    asked_h = (tgt_h - a1) / b1 + gain * (tgt_h - real_h)
+    asked_v = (tgt_v - a2) / b2 + gain * (tgt_v - real_v)
+
+    # Keep a bounded overdrive so the surface cannot fold
+    h_span = max(abs(tgt_h[-1] - tgt_h[0]), 1e-3)
+    v_span = max(abs(tgt_v[-1] - tgt_v[0]), 1e-3)
+    asked_h = np.clip(asked_h, tgt_h[0] - 0.6 * h_span, tgt_h[-1] + 0.6 * h_span)
+    asked_v = np.clip(asked_v, tgt_v[0] - 0.6 * v_span, tgt_v[-1] + 0.6 * v_span)
+    # Force endpoints onto the exact target range (hard rectangle support)
+    asked_h[0], asked_h[-1] = tgt_h[0], tgt_h[-1]
+    asked_v[0], asked_v[-1] = tgt_v[0], tgt_v[-1]
+
+    def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
+        return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
 
     return fn
 
