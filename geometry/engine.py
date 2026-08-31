@@ -564,192 +564,6 @@ def _build_height_field(reflector: MFReflector):
 # ---------------------------------------------------------------------------
 
 
-def _edge_target(target_fn, su: int, sv: int, side: str, k: int) -> Tuple[float, float]:
-    """Angle on a facet border.  k is the index along that border."""
-    if side == "bottom":
-        return target_fn(k, 0)
-    if side == "top":
-        return target_fn(k, sv - 1)
-    if side == "left":
-        return target_fn(0, k)
-    return target_fn(su - 1, k)
-
-
-def _integrate_polyline_edge(
-    coords_t: np.ndarray,
-    x_of,
-    y_of,
-    z0: float,
-    source: np.ndarray,
-    angle_of,
-    n_relax: int = 4,
-) -> np.ndarray:
-    """
-    1-D optical integration along an axis-aligned edge.
-
-    coords_t is the varying coordinate (x along a horizontal edge, y along
-    a vertical one).  At each sample the target direction is prescribed by
-    angle_of(k) → (h_deg, v_deg).  Height is integrated with a trapezoid
-    predictor-corrector so the edge-ray condition is met in 1-D (exact up
-    to discretisation).  Corners stay consistent because we integrate
-    outward from a single seed.
-    """
-    n = len(coords_t)
-    z = np.zeros(n)
-    z[0] = float(z0)
-    for k in range(1, n):
-        dt = float(coords_t[k] - coords_t[k - 1])
-        zk = z[k - 1]
-        for _ in range(max(1, n_relax)):
-            h0, v0 = angle_of(k - 1)
-            h1, v1 = angle_of(k)
-            p0 = np.array([x_of(k - 1), y_of(k - 1), z[k - 1]])
-            p1 = np.array([x_of(k), y_of(k), zk])
-            n0 = _required_normal(source, p0, _target_direction_from_angles(h0, v0))
-            n1 = _required_normal(source, p1, _target_direction_from_angles(h1, v1))
-            s0x, s0y = _slopes_from_normal(n0)
-            s1x, s1y = _slopes_from_normal(n1)
-            # horizontal edge → integrate zx; vertical edge → zy
-            horizontal = abs(x_of(k) - x_of(k - 1)) >= abs(y_of(k) - y_of(k - 1))
-            slope = 0.5 * ((s0x + s1x) if horizontal else (s0y + s1y))
-            zk_new = z[k - 1] + slope * dt
-            if abs(zk_new - zk) < 1e-12:
-                zk = zk_new
-                break
-            zk = zk_new
-        z[k] = zk
-    return z
-
-
-def _edge_ray_borders(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    target_fn,
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-) -> Dict[str, np.ndarray]:
-    """
-    Build the four facet-border height curves by edge-ray integration.
-
-    Seed height is fixed at (seed_i, seed_j).  We walk from the seed to the
-    four corners along the grid lines through the seed, then along the
-    outer borders.  Each border maps to one side of the far-field rectangle
-    because target_fn on that border is constructed that way.
-    """
-    su, sv = len(xs), len(ys)
-    seed_i = int(np.clip(seed_i, 0, su - 1))
-    seed_j = int(np.clip(seed_j, 0, sv - 1))
-
-    # Horizontal line through the seed (constant y = ys[seed_j])
-    def ang_h(i):
-        return target_fn(i, seed_j)
-
-    z_h = np.zeros(su)
-    z_h[seed_i] = z_seed
-    if seed_i < su - 1:
-        z_h[seed_i:] = _integrate_polyline_edge(
-            xs[seed_i:],
-            lambda k, i0=seed_i: xs[i0 + k],
-            lambda k: ys[seed_j],
-            z_seed, source, lambda k, i0=seed_i: ang_h(i0 + k),
-        )
-    if seed_i > 0:
-        xs_rev = xs[: seed_i + 1][::-1]
-        z_left = _integrate_polyline_edge(
-            xs_rev,
-            lambda k, i0=seed_i: xs[i0 - k],
-            lambda k: ys[seed_j],
-            z_seed, source, lambda k, i0=seed_i: ang_h(i0 - k),
-        )
-        z_h[: seed_i + 1] = z_left[::-1]
-
-    # Vertical line through the seed (constant x = xs[seed_i])
-    def ang_v(j):
-        return target_fn(seed_i, j)
-
-    z_v = np.zeros(sv)
-    z_v[seed_j] = z_seed
-    if seed_j < sv - 1:
-        z_v[seed_j:] = _integrate_polyline_edge(
-            ys[seed_j:],
-            lambda k: xs[seed_i],
-            lambda k, j0=seed_j: ys[j0 + k],
-            z_seed, source, lambda k, j0=seed_j: ang_v(j0 + k),
-        )
-    if seed_j > 0:
-        ys_rev = ys[: seed_j + 1][::-1]
-        z_down = _integrate_polyline_edge(
-            ys_rev,
-            lambda k: xs[seed_i],
-            lambda k, j0=seed_j: ys[j0 - k],
-            z_seed, source, lambda k, j0=seed_j: ang_v(j0 - k),
-        )
-        z_v[: seed_j + 1] = z_down[::-1]
-
-    # Outer borders: start from the seed-line hits on each border.
-    bottom = _integrate_polyline_edge(
-        xs,
-        lambda k: xs[k],
-        lambda k: ys[0],
-        z_v[0] if seed_j != 0 else z_h[seed_i] if seed_j == 0 else z_v[0],
-        source, lambda k: target_fn(k, 0),
-    )
-    # Re-anchor bottom at the known seed-column height
-    bottom = bottom - bottom[seed_i] + (z_h[seed_i] if seed_j == 0 else z_v[0])
-
-    top = _integrate_polyline_edge(
-        xs,
-        lambda k: xs[k],
-        lambda k: ys[-1],
-        z_v[-1],
-        source, lambda k: target_fn(k, sv - 1),
-    )
-    top = top - top[seed_i] + z_v[-1]
-
-    left = _integrate_polyline_edge(
-        ys,
-        lambda k: xs[0],
-        lambda k: ys[k],
-        z_h[0],
-        source, lambda k: target_fn(0, k),
-    )
-    left = left - left[seed_j] + z_h[0]
-
-    right = _integrate_polyline_edge(
-        ys,
-        lambda k: xs[-1],
-        lambda k: ys[k],
-        z_h[-1],
-        source, lambda k: target_fn(su - 1, k),
-    )
-    right = right - right[seed_j] + z_h[-1]
-
-    # Average the two estimates of each corner so the four curves close.
-    bl = 0.5 * (bottom[0] + left[0])
-    br = 0.5 * (bottom[-1] + right[0])
-    tl = 0.5 * (top[0] + left[-1])
-    tr = 0.5 * (top[-1] + right[-1])
-    # Linearly bleed the corner adjustment along each edge (keeps seed line).
-    def _bleed(curve: np.ndarray, i0: int, z0: float, i1: int, z1: float) -> np.ndarray:
-        out = curve.copy()
-        n = len(out)
-        if n == 1:
-            out[0] = z0
-            return out
-        # set endpoints, distribute interior as original shape + linear ramp
-        ramp = np.linspace(z0 - curve[0], z1 - curve[-1], n)
-        out = curve + ramp
-        return out
-
-    bottom = _bleed(bottom, 0, bl, su - 1, br)
-    top = _bleed(top, 0, tl, su - 1, tr)
-    left = _bleed(left, 0, bl, sv - 1, tl)
-    right = _bleed(right, 0, br, sv - 1, tr)
-    return {"left": left, "right": right, "bottom": bottom, "top": top}
-
-
 def _solve_facet_optical(
     reflector: MFReflector,
     xs: np.ndarray,
@@ -840,80 +654,6 @@ def _realized_angles_on_block(
     return hs, vs
 
 
-def _warp_frac(frac: float, gamma: float) -> float:
-    """
-    Push parameter toward the edges (gamma < 1) so more facet area is
-    assigned to the outer angles.  Counteracts LS projection which
-    compresses realized angles toward the mean (hot centre).
-    """
-    f = float(np.clip(frac, 0.0, 1.0))
-    if abs(gamma - 1.0) < 1e-6:
-        return f
-    s = 2.0 * f - 1.0
-    return 0.5 + 0.5 * np.sign(s) * (abs(s) ** gamma)
-
-
-def _make_residual_target(
-    iu: int,
-    iv: int,
-    su: int,
-    sv: int,
-    spreads,
-    asked_h: np.ndarray,
-    asked_v: np.ndarray,
-    realized_h: np.ndarray,
-    realized_v: np.ndarray,
-    A1: float,
-    B1: float,
-    A2: float,
-    B2: float,
-    gain: float = 0.65,
-    gamma: float = 0.78,
-):
-    """
-    Next-round asked angles: affine-mapped desired + residual feedback.
-
-    desired is slightly edge-weighted (gamma < 1) for more uniform
-    far-field fill; residual (desired - realized) is added so the
-    integrable projection is driven toward the rectangular map.
-    """
-    corr_h = asked_h + gain * (
-        np.array(
-            [
-                [
-                    spreads.target_angles_on_facet(
-                        iu, iv, _warp_frac(i / max(su - 1, 1), gamma),
-                        _warp_frac(j / max(sv - 1, 1), gamma),
-                    )[0]
-                    for i in range(su)
-                ]
-                for j in range(sv)
-            ]
-        )
-        - realized_h
-    )
-    corr_v = asked_v + gain * (
-        np.array(
-            [
-                [
-                    spreads.target_angles_on_facet(
-                        iu, iv, _warp_frac(i / max(su - 1, 1), gamma),
-                        _warp_frac(j / max(sv - 1, 1), gamma),
-                    )[1]
-                    for i in range(su)
-                ]
-                for j in range(sv)
-            ]
-        )
-        - realized_v
-    )
-
-    def fn(li: int, lj: int, ch=corr_h, cv=corr_v) -> Tuple[float, float]:
-        return float(ch[lj, li]), float(cv[lj, li])
-
-    return fn
-
-
 def _separable_inverse_target(
     iu: int,
     iv: int,
@@ -954,14 +694,26 @@ def _separable_inverse_target(
     asked_h = (tgt_h - a1) / b1 + gain * (tgt_h - real_h)
     asked_v = (tgt_v - a2) / b2 + gain * (tgt_v - real_v)
 
-    # Keep a bounded overdrive so the surface cannot fold
+    # Keep a bounded overdrive so the surface cannot fold.
+    # Use min/max of the list.  A decreasing list such as V=(10,-10)
+    # makes tgt[0]-span / tgt[-1]+span collapse to ~[-2,+2] and the
+    # far-field squashes into two thin horizontal bands.
     h_span = max(abs(tgt_h[-1] - tgt_h[0]), 1e-3)
     v_span = max(abs(tgt_v[-1] - tgt_v[0]), 1e-3)
-    asked_h = np.clip(asked_h, tgt_h[0] - 0.6 * h_span, tgt_h[-1] + 0.6 * h_span)
-    asked_v = np.clip(asked_v, tgt_v[0] - 0.6 * v_span, tgt_v[-1] + 0.6 * v_span)
-    # Force endpoints onto the exact target range (hard rectangle support)
-    asked_h[0], asked_h[-1] = tgt_h[0], tgt_h[-1]
-    asked_v[0], asked_v[-1] = tgt_v[0], tgt_v[-1]
+    h_lo, h_hi = float(np.min(tgt_h)), float(np.max(tgt_h))
+    v_lo, v_hi = float(np.min(tgt_v)), float(np.max(tgt_v))
+    asked_h = np.clip(asked_h, h_lo - 0.6 * h_span, h_hi + 0.6 * h_span)
+    asked_v = np.clip(asked_v, v_lo - 0.6 * v_span, v_hi + 0.6 * v_span)
+    # Soft endpoint blend.  Hard-pinning dumped leftover +V into the last
+    # grid row; NURBS then wiped that strip and the far-field clipped ~+6°.
+    asked_h[0] = 0.35 * asked_h[0] + 0.65 * tgt_h[0]
+    asked_h[-1] = 0.35 * asked_h[-1] + 0.65 * tgt_h[-1]
+    asked_v[0] = 0.35 * asked_v[0] + 0.65 * tgt_v[0]
+    asked_v[-1] = 0.35 * asked_v[-1] + 0.65 * tgt_v[-1]
+    if su >= 3:
+        asked_h[1:-1] = 0.25 * asked_h[:-2] + 0.50 * asked_h[1:-1] + 0.25 * asked_h[2:]
+    if sv >= 3:
+        asked_v[1:-1] = 0.25 * asked_v[:-2] + 0.50 * asked_v[1:-1] + 0.25 * asked_v[2:]
 
     def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
         return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
