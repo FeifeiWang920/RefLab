@@ -250,15 +250,23 @@ def _reconstruct_height_from_slopes(
     n_eq = nv * (nu - 1) + (nv - 1) * nu
     A = np.zeros((n_eq, N))
     b = np.zeros(n_eq)
+    w = np.ones(n_eq)
     k = 0
+    # Interval slope = average of the two node slopes (trapezoid rule).
+    # Using only the left/bottom node systematically under-steers the
+    # surface and packs rays toward the mean angle (hot centre + soft edge).
+    # Boundary intervals get a higher weight so the rectangular far-field
+    # outline is honoured even when the slope field is not conservative.
     for j in range(nv):
+        wrow = 2.5 if (j == 0 or j == nv - 1) else 1.0
         for i in range(nu - 1):
             dx = xs[i + 1] - xs[i]
             if dx <= 0.0:
                 continue
             A[k, j * nu + i + 1] = 1.0 / dx
             A[k, j * nu + i] = -1.0 / dx
-            b[k] = dzx[j, i]
+            b[k] = 0.5 * (dzx[j, i] + dzx[j, i + 1])
+            w[k] = wrow * (2.5 if (i == 0 or i == nu - 2) else 1.0)
             k += 1
     for j in range(nv - 1):
         for i in range(nu):
@@ -267,10 +275,16 @@ def _reconstruct_height_from_slopes(
                 continue
             A[k, (j + 1) * nu + i] = 1.0 / dy
             A[k, j * nu + i] = -1.0 / dy
-            b[k] = dzy[j, i]
+            b[k] = 0.5 * (dzy[j, i] + dzy[j + 1, i])
+            wcol = 2.5 if (i == 0 or i == nu - 1) else 1.0
+            w[k] = wcol * (2.5 if (j == 0 or j == nv - 2) else 1.0)
             k += 1
     A = A[:k]
     b = b[:k]
+    w = w[:k]
+    sw = np.sqrt(w)
+    A = A * sw[:, None]
+    b = b * sw
 
     # Fix the seed height (Dirichlet constraint): solve for the other nodes.
     mask = np.ones(N, dtype=bool)
@@ -404,32 +418,56 @@ def _build_height_field(reflector: MFReflector):
         )
 
     # ------------------------------------------------------------------
-    # Pass 2: spread calibration (one affine round).
-    # The least-squares surface reproduces the requested spread only to the
-    # discretisation accuracy (~1-3° at facet borders).  Measure the affine
-    # deviation  realised ≈ a + b·target  on each facet and re-solve with the
-    # corrected target mapping, so the realised far-field extent of every facet
-    # matches the requested angle range (rectangular spot).
+    # Pass 2: one edge-extrema affine calibration (range only).
+    # Does not lock inconsistent 1-D borders.  Compensates the global
+    # stretch/shift of the integrable projection so the far-field extent
+    # matches the requested rectangle as closely as a single graph allows.
     # ------------------------------------------------------------------
-    calib = _calibrate_facets(abs_blocks, facet_grids, source, spreads, su, sv)
-    cal_blocks: Dict[Tuple[int, int], np.ndarray] = {}
+    cal_blocks: Dict[Tuple[int, int], np.ndarray] = dict(abs_blocks)
+    acc_calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {
+        k: (0.0, 1.0, 0.0, 1.0) for k in abs_blocks
+    }
+    calib = _calibrate_facets(cal_blocks, facet_grids, source, spreads, su, sv)
+    new_blocks: Dict[Tuple[int, int], np.ndarray] = {}
     for iu, iv in solve_order:
         xs, ys = facet_grids[(iu, iv)]
         seed_i, seed_j, z_ref = facet_seeds[(iu, iv)]
-        ah, bh, av, bv = calib[(iu, iv)]
+        a1, b1, a2, b2 = calib[(iu, iv)]
+        acc_calib[(iu, iv)] = (a1, b1, a2, b2)
 
-        def cal_target(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
+        def cal_target(li: int, lj: int, a1=a1, b1=b1, a2=a2, b2=b2,
                        iu=iu, iv=iv) -> Tuple[float, float]:
             h_deg, v_deg = spreads.target_angles_on_facet(
                 iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
             )
-            return (h_deg - ah) / bh, (v_deg - av) / bv
+            if abs(b1) < 1e-6:
+                b1 = 1.0
+            if abs(b2) < 1e-6:
+                b2 = 1.0
+            return (h_deg - a1) / b1, (v_deg - a2) / b2
 
-        cal_blocks[(iu, iv)] = _solve_facet_optical(
+        new_blocks[(iu, iv)] = _solve_facet_optical(
             reflector, xs, ys, source, cal_target, su, sv,
             z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
-            z_init=abs_blocks[(iu, iv)],
+            z_init=cal_blocks[(iu, iv)],
         )
+    cal_blocks = new_blocks
+    residual_targets: Dict[Tuple[int, int], object] = {}
+    for iu, iv in solve_order:
+        a1, b1, a2, b2 = acc_calib[(iu, iv)]
+
+        def fn(li: int, lj: int, a1=a1, b1=b1, a2=a2, b2=b2,
+               iu=iu, iv=iv) -> Tuple[float, float]:
+            h_deg, v_deg = spreads.target_angles_on_facet(
+                iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
+            )
+            if abs(b1) < 1e-6:
+                b1 = 1.0
+            if abs(b2) < 1e-6:
+                b2 = 1.0
+            return (h_deg - a1) / b1, (v_deg - a2) / b2
+
+        residual_targets[(iu, iv)] = fn
 
     # ------------------------------------------------------------------
     # Pass 3: neighbour influence.
@@ -454,17 +492,18 @@ def _build_height_field(reflector: MFReflector):
                 "bottom": border_curves[("v", iu, iv)] if iv > 0 else None,
                 "top": border_curves[("v", iu, iv + 1)] if iv < n_v - 1 else None,
             }
-            ah, bh, av, bv = calib[(iu, iv)]
-
-            def cal_target2(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
-                            iu=iu, iv=iv) -> Tuple[float, float]:
-                h_deg, v_deg = spreads.target_angles_on_facet(
-                    iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
-                )
-                return (h_deg - ah) / bh, (v_deg - av) / bv
+            ah, bh, av, bv = acc_calib[(iu, iv)]
+            fn = residual_targets.get((iu, iv))
+            if fn is None:
+                def fn(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
+                       iu=iu, iv=iv) -> Tuple[float, float]:
+                    h_deg, v_deg = spreads.target_angles_on_facet(
+                        iu, iv, li / max(su - 1, 1), lj / max(sv - 1, 1)
+                    )
+                    return (h_deg - ah) / bh, (v_deg - av) / bv
 
             blk = _solve_facet_with_borders(
-                reflector, cal_blocks[(iu, iv)], spread_target=cal_target2,
+                reflector, cal_blocks[(iu, iv)], spread_target=fn,
                 xs=xs, ys=ys, source=source, zb=zb,
                 su=su, sv=sv, z_step=float(iu * z_step_u + iv * z_step_v),
             )
@@ -514,6 +553,192 @@ def _build_height_field(reflector: MFReflector):
 # ---------------------------------------------------------------------------
 
 
+def _edge_target(target_fn, su: int, sv: int, side: str, k: int) -> Tuple[float, float]:
+    """Angle on a facet border.  k is the index along that border."""
+    if side == "bottom":
+        return target_fn(k, 0)
+    if side == "top":
+        return target_fn(k, sv - 1)
+    if side == "left":
+        return target_fn(0, k)
+    return target_fn(su - 1, k)
+
+
+def _integrate_polyline_edge(
+    coords_t: np.ndarray,
+    x_of,
+    y_of,
+    z0: float,
+    source: np.ndarray,
+    angle_of,
+    n_relax: int = 4,
+) -> np.ndarray:
+    """
+    1-D optical integration along an axis-aligned edge.
+
+    coords_t is the varying coordinate (x along a horizontal edge, y along
+    a vertical one).  At each sample the target direction is prescribed by
+    angle_of(k) → (h_deg, v_deg).  Height is integrated with a trapezoid
+    predictor-corrector so the edge-ray condition is met in 1-D (exact up
+    to discretisation).  Corners stay consistent because we integrate
+    outward from a single seed.
+    """
+    n = len(coords_t)
+    z = np.zeros(n)
+    z[0] = float(z0)
+    for k in range(1, n):
+        dt = float(coords_t[k] - coords_t[k - 1])
+        zk = z[k - 1]
+        for _ in range(max(1, n_relax)):
+            h0, v0 = angle_of(k - 1)
+            h1, v1 = angle_of(k)
+            p0 = np.array([x_of(k - 1), y_of(k - 1), z[k - 1]])
+            p1 = np.array([x_of(k), y_of(k), zk])
+            n0 = _required_normal(source, p0, _target_direction_from_angles(h0, v0))
+            n1 = _required_normal(source, p1, _target_direction_from_angles(h1, v1))
+            s0x, s0y = _slopes_from_normal(n0)
+            s1x, s1y = _slopes_from_normal(n1)
+            # horizontal edge → integrate zx; vertical edge → zy
+            horizontal = abs(x_of(k) - x_of(k - 1)) >= abs(y_of(k) - y_of(k - 1))
+            slope = 0.5 * ((s0x + s1x) if horizontal else (s0y + s1y))
+            zk_new = z[k - 1] + slope * dt
+            if abs(zk_new - zk) < 1e-12:
+                zk = zk_new
+                break
+            zk = zk_new
+        z[k] = zk
+    return z
+
+
+def _edge_ray_borders(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    target_fn,
+    z_seed: float,
+    seed_i: int,
+    seed_j: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Build the four facet-border height curves by edge-ray integration.
+
+    Seed height is fixed at (seed_i, seed_j).  We walk from the seed to the
+    four corners along the grid lines through the seed, then along the
+    outer borders.  Each border maps to one side of the far-field rectangle
+    because target_fn on that border is constructed that way.
+    """
+    su, sv = len(xs), len(ys)
+    seed_i = int(np.clip(seed_i, 0, su - 1))
+    seed_j = int(np.clip(seed_j, 0, sv - 1))
+
+    # Horizontal line through the seed (constant y = ys[seed_j])
+    def ang_h(i):
+        return target_fn(i, seed_j)
+
+    z_h = np.zeros(su)
+    z_h[seed_i] = z_seed
+    if seed_i < su - 1:
+        z_h[seed_i:] = _integrate_polyline_edge(
+            xs[seed_i:],
+            lambda k, i0=seed_i: xs[i0 + k],
+            lambda k: ys[seed_j],
+            z_seed, source, lambda k, i0=seed_i: ang_h(i0 + k),
+        )
+    if seed_i > 0:
+        xs_rev = xs[: seed_i + 1][::-1]
+        z_left = _integrate_polyline_edge(
+            xs_rev,
+            lambda k, i0=seed_i: xs[i0 - k],
+            lambda k: ys[seed_j],
+            z_seed, source, lambda k, i0=seed_i: ang_h(i0 - k),
+        )
+        z_h[: seed_i + 1] = z_left[::-1]
+
+    # Vertical line through the seed (constant x = xs[seed_i])
+    def ang_v(j):
+        return target_fn(seed_i, j)
+
+    z_v = np.zeros(sv)
+    z_v[seed_j] = z_seed
+    if seed_j < sv - 1:
+        z_v[seed_j:] = _integrate_polyline_edge(
+            ys[seed_j:],
+            lambda k: xs[seed_i],
+            lambda k, j0=seed_j: ys[j0 + k],
+            z_seed, source, lambda k, j0=seed_j: ang_v(j0 + k),
+        )
+    if seed_j > 0:
+        ys_rev = ys[: seed_j + 1][::-1]
+        z_down = _integrate_polyline_edge(
+            ys_rev,
+            lambda k: xs[seed_i],
+            lambda k, j0=seed_j: ys[j0 - k],
+            z_seed, source, lambda k, j0=seed_j: ang_v(j0 - k),
+        )
+        z_v[: seed_j + 1] = z_down[::-1]
+
+    # Outer borders: start from the seed-line hits on each border.
+    bottom = _integrate_polyline_edge(
+        xs,
+        lambda k: xs[k],
+        lambda k: ys[0],
+        z_v[0] if seed_j != 0 else z_h[seed_i] if seed_j == 0 else z_v[0],
+        source, lambda k: target_fn(k, 0),
+    )
+    # Re-anchor bottom at the known seed-column height
+    bottom = bottom - bottom[seed_i] + (z_h[seed_i] if seed_j == 0 else z_v[0])
+
+    top = _integrate_polyline_edge(
+        xs,
+        lambda k: xs[k],
+        lambda k: ys[-1],
+        z_v[-1],
+        source, lambda k: target_fn(k, sv - 1),
+    )
+    top = top - top[seed_i] + z_v[-1]
+
+    left = _integrate_polyline_edge(
+        ys,
+        lambda k: xs[0],
+        lambda k: ys[k],
+        z_h[0],
+        source, lambda k: target_fn(0, k),
+    )
+    left = left - left[seed_j] + z_h[0]
+
+    right = _integrate_polyline_edge(
+        ys,
+        lambda k: xs[-1],
+        lambda k: ys[k],
+        z_h[-1],
+        source, lambda k: target_fn(su - 1, k),
+    )
+    right = right - right[seed_j] + z_h[-1]
+
+    # Average the two estimates of each corner so the four curves close.
+    bl = 0.5 * (bottom[0] + left[0])
+    br = 0.5 * (bottom[-1] + right[0])
+    tl = 0.5 * (top[0] + left[-1])
+    tr = 0.5 * (top[-1] + right[-1])
+    # Linearly bleed the corner adjustment along each edge (keeps seed line).
+    def _bleed(curve: np.ndarray, i0: int, z0: float, i1: int, z1: float) -> np.ndarray:
+        out = curve.copy()
+        n = len(out)
+        if n == 1:
+            out[0] = z0
+            return out
+        # set endpoints, distribute interior as original shape + linear ramp
+        ramp = np.linspace(z0 - curve[0], z1 - curve[-1], n)
+        out = curve + ramp
+        return out
+
+    bottom = _bleed(bottom, 0, bl, su - 1, br)
+    top = _bleed(top, 0, tl, su - 1, tr)
+    left = _bleed(left, 0, bl, sv - 1, tl)
+    right = _bleed(right, 0, br, sv - 1, tr)
+    return {"left": left, "right": right, "bottom": bottom, "top": top}
+
+
 def _solve_facet_optical(
     reflector: MFReflector,
     xs: np.ndarray,
@@ -528,9 +753,13 @@ def _solve_facet_optical(
     z_init: np.ndarray,
 ) -> np.ndarray:
     """
-    Fixed-point solve of one facet: at every node take the reflection-law
-    normal for the spread target, integrate the slope field by least-squares
-    gradient matching, and iterate until the surface stops moving.
+    Single integrable surface from a seed height.
+
+    Independent 1-D integration of the four borders is *not* used: those
+    four curves generally do not lie on one graph, and locking them
+    twists the patch (star-shaped far field).  The slope field from the
+    reflection law is projected onto a conservative field by weighted LS,
+    which is the unique least-wrinkled surface compatible with the seed.
     """
     max_iter = max(1, int(reflector.solver_iterations))
     tol = max(0.0, float(reflector.solver_tolerance))
@@ -600,6 +829,80 @@ def _realized_angles_on_block(
     return hs, vs
 
 
+def _warp_frac(frac: float, gamma: float) -> float:
+    """
+    Push parameter toward the edges (gamma < 1) so more facet area is
+    assigned to the outer angles.  Counteracts LS projection which
+    compresses realized angles toward the mean (hot centre).
+    """
+    f = float(np.clip(frac, 0.0, 1.0))
+    if abs(gamma - 1.0) < 1e-6:
+        return f
+    s = 2.0 * f - 1.0
+    return 0.5 + 0.5 * np.sign(s) * (abs(s) ** gamma)
+
+
+def _make_residual_target(
+    iu: int,
+    iv: int,
+    su: int,
+    sv: int,
+    spreads,
+    asked_h: np.ndarray,
+    asked_v: np.ndarray,
+    realized_h: np.ndarray,
+    realized_v: np.ndarray,
+    A1: float,
+    B1: float,
+    A2: float,
+    B2: float,
+    gain: float = 0.65,
+    gamma: float = 0.78,
+):
+    """
+    Next-round asked angles: affine-mapped desired + residual feedback.
+
+    desired is slightly edge-weighted (gamma < 1) for more uniform
+    far-field fill; residual (desired - realized) is added so the
+    integrable projection is driven toward the rectangular map.
+    """
+    corr_h = asked_h + gain * (
+        np.array(
+            [
+                [
+                    spreads.target_angles_on_facet(
+                        iu, iv, _warp_frac(i / max(su - 1, 1), gamma),
+                        _warp_frac(j / max(sv - 1, 1), gamma),
+                    )[0]
+                    for i in range(su)
+                ]
+                for j in range(sv)
+            ]
+        )
+        - realized_h
+    )
+    corr_v = asked_v + gain * (
+        np.array(
+            [
+                [
+                    spreads.target_angles_on_facet(
+                        iu, iv, _warp_frac(i / max(su - 1, 1), gamma),
+                        _warp_frac(j / max(sv - 1, 1), gamma),
+                    )[1]
+                    for i in range(su)
+                ]
+                for j in range(sv)
+            ]
+        )
+        - realized_v
+    )
+
+    def fn(li: int, lj: int, ch=corr_h, cv=corr_v) -> Tuple[float, float]:
+        return float(ch[lj, li]), float(cv[lj, li])
+
+    return fn
+
+
 def _calibrate_facets(
     blocks: Dict[Tuple[int, int], np.ndarray],
     grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]],
@@ -611,39 +914,61 @@ def _calibrate_facets(
     """
     Per-facet affine calibration of the spread mapping.
 
-    realized_h ≈ ah + bh·target_h   and   realized_v ≈ av + bv·target_v
-    are fitted at the nodes of the pass-1 solution.  The corrected target map
-    (h-ah)/bh, (v-av)/bv makes the realised far-field extent of the facet equal
-    the requested angle range (rectangular spot).
+    Priority is matching the *boundary extrema* of the realised far-field to
+    the requested (h_min, h_max, v_min, v_max) so the spot is a hard rectangle.
+    Interior nodes are used only as a fallback when edges are degenerate.
+
+    Model:  realized ≈ a + b · target
+    Inverse map used on the next solve:  target' = (desired - a) / b
     """
     calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
     for key, blk in blocks.items():
         xs, ys = grids[key]
-        th, tv = [], []
-        rh, rv = [], []
-        for j in range(1, sv - 1):
-            for i in range(1, su - 1):
-                h_, v_ = spreads.target_angles_on_facet(
-                    key[0], key[1], i / max(su - 1, 1), j / max(sv - 1, 1)
-                )
-                th.append(h_)
-                tv.append(v_)
+        iu, iv = key
         hs, vs = _realized_angles_on_block(blk, xs, ys, source)
-        for j in range(1, sv - 1):
-            for i in range(1, su - 1):
-                rh.append(hs[j, i])
-                rv.append(vs[j, i])
-        th, tv, rh, rv = map(np.asarray, (th, tv, rh, rv))
 
-        def fit(target, realized):
-            if float(np.ptp(target)) < 1e-6:
+        # Requested corner angles of this facet
+        h00, v00 = spreads.target_angles_on_facet(iu, iv, 0.0, 0.0)
+        h10, v10 = spreads.target_angles_on_facet(iu, iv, 1.0, 0.0)
+        h01, v01 = spreads.target_angles_on_facet(iu, iv, 0.0, 1.0)
+        h11, v11 = spreads.target_angles_on_facet(iu, iv, 1.0, 1.0)
+        th_min = min(h00, h10, h01, h11)
+        th_max = max(h00, h10, h01, h11)
+        tv_min = min(v00, v10, v01, v11)
+        tv_max = max(v00, v10, v01, v11)
+
+        # Realised extrema on the four edges (more stable than single corners)
+        # left i=0, right i=-1, bottom j=0, top j=-1
+        rh_left = float(np.mean(hs[:, 0]))
+        rh_right = float(np.mean(hs[:, -1]))
+        rv_bot = float(np.mean(vs[0, :]))
+        rv_top = float(np.mean(vs[-1, :]))
+        rh_min = min(rh_left, rh_right)
+        rh_max = max(rh_left, rh_right)
+        rv_min = min(rv_bot, rv_top)
+        rv_max = max(rv_bot, rv_top)
+
+        def edge_fit(t_min: float, t_max: float, r_min: float, r_max: float):
+            dt = t_max - t_min
+            if abs(dt) < 1e-9:
                 return 0.0, 1.0
-            slope, intercept = np.polyfit(target, realized, 1)
-            slope = float(np.clip(slope, 0.5, 1.5))
-            return float(intercept), slope
+            # r = a + b * t  matched at the two ends
+            b = (r_max - r_min) / dt
+            # keep a mild clip so a bad first pass cannot invert the map
+            b = float(np.clip(b, 0.4, 2.5))
+            a = r_min - b * t_min
+            return float(a), b
 
-        ah, bh = fit(th, rh)
-        av, bv = fit(tv, rv)
+        # Orient so that left→th_min side, right→th_max side
+        if rh_left <= rh_right:
+            ah, bh = edge_fit(th_min, th_max, rh_left, rh_right)
+        else:
+            ah, bh = edge_fit(th_min, th_max, rh_right, rh_left)
+        if rv_bot <= rv_top:
+            av, bv = edge_fit(tv_min, tv_max, rv_bot, rv_top)
+        else:
+            av, bv = edge_fit(tv_min, tv_max, rv_top, rv_bot)
+
         calib[key] = (ah, bh, av, bv)
     return calib
 
@@ -711,7 +1036,7 @@ def _ls_reconstruct_with_borders(
                 continue
             A[k, j * nu + i + 1] = 1.0 / dx
             A[k, j * nu + i] = -1.0 / dx
-            b[k] = dzx[j, i]
+            b[k] = 0.5 * (dzx[j, i] + dzx[j, i + 1])
             k += 1
     for j in range(nv - 1):
         for i in range(nu):
@@ -720,7 +1045,7 @@ def _ls_reconstruct_with_borders(
                 continue
             A[k, (j + 1) * nu + i] = 1.0 / dy
             A[k, j * nu + i] = -1.0 / dy
-            b[k] = dzy[j, i]
+            b[k] = 0.5 * (dzy[j, i] + dzy[j + 1, i])
             k += 1
     A = A[:k]
     b = b[:k]
