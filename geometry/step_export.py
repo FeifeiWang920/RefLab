@@ -84,6 +84,95 @@ def facet_to_bspline_surface(facet: Facet):
             return None
 
 
+def _count_roots(shape) -> int:
+    from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_COMPSOLID, TopAbs_SHELL, TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+
+    t = shape.ShapeType()
+    if t in (TopAbs_SHELL, TopAbs_FACE):
+        return 1
+    if t not in (TopAbs_COMPOUND, TopAbs_COMPSOLID):
+        return 1
+    n = 0
+    for kind in (TopAbs_SHELL, TopAbs_FACE):
+        exp = TopExp_Explorer(shape, kind)
+        while exp.More():
+            n += 1
+            exp.Next()
+        if n:
+            return n
+    return 1
+
+
+def _pack_faces_as_one_shell(faces):
+    """
+    Put every face into a single open shell.
+
+    Empty-gap facets do not touch, so Sewing returns a compound of many
+    shells.  CATIA then opens that compound as an assembly (one Part per
+    face).  One open shell is still a single root shape / single Part.
+    """
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Shell
+
+    shell = TopoDS_Shell()
+    builder = BRep_Builder()
+    builder.MakeShell(shell)
+    for face in faces:
+        builder.Add(shell, face)
+    try:
+        shell.Closed(False)
+    except Exception:
+        pass
+    return shell
+
+
+def _make_single_shape(faces, sew: bool, sew_tolerance: float):
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+
+    if len(faces) == 1:
+        return faces[0]
+    if sew:
+        sewing = BRepBuilderAPI_Sewing(sew_tolerance)
+        try:
+            sewing.SetNonManifold(True)
+        except Exception:
+            pass
+        for face in faces:
+            sewing.Add(face)
+        sewing.Perform()
+        sewn = sewing.SewedShape()
+        if _count_roots(sewn) <= 1:
+            return sewn
+    return _pack_faces_as_one_shell(faces)
+
+
+def _configure_step_writer() -> None:
+    from OCP.Interface import Interface_Static
+
+    Interface_Static.SetCVal_s("write.step.schema", "AP203")
+    Interface_Static.SetCVal_s("write.step.unit", "MM")
+    try:
+        Interface_Static.SetCVal_s("write.surfacecurve.mode", "0")
+    except Exception:
+        pass
+    # Prevent OCC from emitting a PRODUCT tree (one Part per face).
+    for key, val in (
+        ("write.step.assembly", 0),
+        ("write.step.product.name", "MF_Reflector"),
+    ):
+        try:
+            if isinstance(val, int):
+                Interface_Static.SetIVal_s(key, val)
+            else:
+                Interface_Static.SetCVal_s(key, val)
+        except Exception:
+            try:
+                Interface_Static.SetCVal_s(key, str(val))
+            except Exception:
+                pass
+
+
 def facets_to_step(
     facets: List[Facet],
     path: str,
@@ -92,17 +181,14 @@ def facets_to_step(
     sew_tolerance: float = 0.05,
 ) -> int:
     """
-    Write NURBS facets to STEP as a *single sewn shell* (one body).
+    Write NURBS facets to STEP as *one* root shape (one CATIA Part).
 
-    sew=True  → BRepBuilderAPI_Sewing so CATIA sees one shape
-    sew=False → compound of individual faces
+    Touching faces (gap = surface) are sewn.  Disjoint faces (gap = empty)
+    are packed into a single open shell so CATIA does not create an assembly.
     """
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
     from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
     from OCP.IFSelect import IFSelect_ReturnStatus
-    from OCP.TopoDS import TopoDS_Compound, TopoDS_Shape
-    from OCP.BRep import BRep_Builder
-    from OCP.Interface import Interface_Static
 
     faces = []
     for f in facets:
@@ -122,30 +208,8 @@ def facets_to_step(
         raise RuntimeError("No valid NURBS faces to export")
 
     n_faces = len(faces)
-
-    # ---- Sew into one shell (preferred for CATIA) ----
-    shape: TopoDS_Shape
-    if sew and n_faces > 1:
-        sewing = BRepBuilderAPI_Sewing(sew_tolerance)
-        for face in faces:
-            sewing.Add(face)
-        sewing.Perform()
-        shape = sewing.SewedShape()
-    else:
-        builder = BRep_Builder()
-        compound = TopoDS_Compound()
-        builder.MakeCompound(compound)
-        for face in faces:
-            builder.Add(compound, face)
-        shape = compound
-
-    Interface_Static.SetCVal_s("write.step.schema", "AP203")
-    Interface_Static.SetCVal_s("write.step.unit", "MM")
-    # Write as one solid/shell representation when possible
-    try:
-        Interface_Static.SetCVal_s("write.surfacecurve.mode", "0")
-    except Exception:
-        pass
+    shape = _make_single_shape(faces, sew=sew, sew_tolerance=sew_tolerance)
+    _configure_step_writer()
 
     writer = STEPControl_Writer()
     writer.Transfer(shape, STEPControl_AsIs)
