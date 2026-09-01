@@ -702,8 +702,8 @@ def _separable_inverse_target(
     v_span = max(abs(tgt_v[-1] - tgt_v[0]), 1e-3)
     h_lo, h_hi = float(np.min(tgt_h)), float(np.max(tgt_h))
     v_lo, v_hi = float(np.min(tgt_v)), float(np.max(tgt_v))
-    asked_h = np.clip(asked_h, h_lo - 0.6 * h_span, h_hi + 0.6 * h_span)
-    asked_v = np.clip(asked_v, v_lo - 0.6 * v_span, v_hi + 0.6 * v_span)
+    asked_h = np.clip(asked_h, h_lo, h_hi)
+    asked_v = np.clip(asked_v, v_lo, v_hi)
     # Soft endpoint blend.  Hard-pinning dumped leftover +V into the last
     # grid row; NURBS then wiped that strip and the far-field clipped ~+6°.
     asked_h[0] = 0.35 * asked_h[0] + 0.65 * tgt_h[0]
