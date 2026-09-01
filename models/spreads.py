@@ -5,7 +5,8 @@ Key rule (per user / LucidShape):
   - An angle list such as H = (-20, 20) or H = (0, 5, 10, 15, 20)
     describes the far-field horizontal spread of *one facet*.
   - Inside that facet the target angle is distributed evenly
-    (by normalised parameter / projected area) across the list.
+    by normalised parameter (default), or by incident flux when
+    uniform_intensity is enabled so the far-field rectangle is flat.
   - Simple two-value form (-20, 20) → linear from -20° to 20°.
   - Multi-value form (-20, -10, 20) → piecewise-linear interpolation
     so equal parameter steps map to equal segments of the angle list.
@@ -83,6 +84,15 @@ class SpreadsConfig:
     global_shift_v: float = 0.0
     global_scale_h: float = 1.0
     global_scale_v: float = 1.0
+
+    # Off (default): facet parameter (u, v) maps evenly onto the angle lists.
+    # On: remap by incident flux so each facet fills its H/V rectangle
+    # with uniform far-field intensity (see geometry.engine energy mapping).
+    uniform_intensity: bool = False
+    # Flux-power over-compensation when uniform_intensity is on.
+    # frac = CDF(flux^γ).  1 = étendue-correct; >1 over-weights the
+    # peak to fight integrable-projection pile-up.  Clamped to [0.8, 2].
+    energy_gamma: float = 1.0
 
     center_offset: np.ndarray = field(default_factory=lambda: np.zeros(3))
 

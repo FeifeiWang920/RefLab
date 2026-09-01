@@ -141,6 +141,77 @@ def test_step_back_no_gap_applies_z_steps():
     assert [round(f.z_step, 12) for f in facets] == [0.0, 0.3, 0.6]
 
 
+def test_uniform_intensity_off_matches_legacy():
+    a = _reflector(2, 2)
+    b = _reflector(2, 2)
+    b.spreads.uniform_intensity = False
+    za = __import__("geometry.engine", fromlist=["_build_height_field"])._build_height_field(a)[2]
+    zb = __import__("geometry.engine", fromlist=["_build_height_field"])._build_height_field(b)[2]
+    assert np.allclose(za, zb)
+
+
+def test_uniform_intensity_changes_surface_when_flux_varies():
+    # Close, offset source → strong 1/r² variation across a large facet.
+    engine = __import__("geometry.engine", fromlist=["_build_height_field", "_energy_fracs"])
+    common = dict(
+        n_u=1,
+        n_v=1,
+    )
+    off = _reflector(**common)
+    on = _reflector(**common)
+    off.source = PointSource(position=np.array([18.0, 12.0, 8.0]))
+    on.source = PointSource(position=np.array([18.0, 12.0, 8.0]))
+    off.grid.width_deltas = [40.0]
+    off.grid.height_deltas = [40.0]
+    off.grid.offset_x = -20.0
+    off.grid.offset_y = -20.0
+    on.grid.width_deltas = [40.0]
+    on.grid.height_deltas = [40.0]
+    on.grid.offset_x = -20.0
+    on.grid.offset_y = -20.0
+    on.spreads.uniform_intensity = True
+    z_off = engine._build_height_field(off)[2]
+    z_on = engine._build_height_field(on)[2]
+    assert np.isfinite(z_on).all()
+    assert np.max(np.abs(z_on - z_off)) > 1e-4
+
+    xs = np.linspace(-20.0, 20.0, 9)
+    ys = np.linspace(-20.0, 20.0, 9)
+    xx, yy = np.meshgrid(xs, ys)
+    carrier = np.asarray(
+        engine._carrier_z(xx, yy, on.source.position, on.grid.focal),
+        dtype=float,
+    )
+    fu, fv = engine._energy_fracs(xs, ys, carrier, on.source.position)
+    assert fu[0] == 0.0 and fu[-1] == 1.0
+    assert fv[0] == 0.0 and fv[-1] == 1.0
+    # Offset source → CDF is not the linear parameter.
+    assert np.max(np.abs(fu - np.linspace(0.0, 1.0, fu.size))) > 1e-3
+
+    w_iso = engine._incident_flux_weights(
+        xs, ys, carrier, on.source.position, pattern="isotropic"
+    )
+    w_lam = engine._incident_flux_weights(
+        xs, ys, carrier, on.source.position, pattern="lambertian", lambert_n=1.0
+    )
+    assert np.isfinite(w_lam).all() and np.all(w_lam >= 0.0)
+    # Lambertian cosθ_s weights the near-axis cells more than isotropic.
+    assert not np.allclose(w_iso, w_lam)
+
+
+def test_source_axis_xyz_overrides_auto():
+    engine = __import__("geometry.engine", fromlist=["_source_emission_axis"])
+    r = _reflector(1, 1)
+    r.source = PointSource(
+        position=np.array([0.0, 0.0, 0.0]),
+        axis=np.array([0.3, -0.4, -0.5]),
+    )
+    axis = engine._source_emission_axis(r)
+    expect = np.array([0.3, -0.4, -0.5])
+    expect = expect / np.linalg.norm(expect)
+    assert np.allclose(axis, expect)
+
+
 def test_fit_patches_with_tangent_continuity():
     reflector = _reflector(1, 1)
     reflector.fit_patches_u = 2

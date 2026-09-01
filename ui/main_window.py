@@ -87,10 +87,29 @@ class MFReflectorApp:
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="Grid & Source")
 
-        source = ttk.LabelFrame(tab, text="Source (Point)", padding=8)
+        source = ttk.LabelFrame(tab, text="Source (Point / Lambertian)", padding=8)
         source.pack(fill=tk.X, pady=(0, 8))
-        self.src_z = self._add_entry(source, "Z position [mm]", "0.0", 0)
-        self.focal = self._add_entry(source, "Carrier focal [mm]", "10.0", 1)
+        self.src_x = self._add_entry(source, "X position [mm]", "0.0", 0)
+        self.src_y = self._add_entry(source, "Y position [mm]", "0.0", 1)
+        self.src_z = self._add_entry(source, "Z position [mm]", "0.0", 2)
+        self.focal = self._add_entry(source, "Carrier focal [mm]", "10.0", 3)
+        self.src_pattern = self._add_combobox(
+            source,
+            "Angular pattern",
+            ["lambertian", "isotropic"],
+            "lambertian",
+            4,
+        )
+        self.src_lambert_n = self._add_entry(source, "Lambertian order n", "1.0", 5)
+        self.src_axis_auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            source,
+            text="Auto axis (source → reflector centre)",
+            variable=self.src_axis_auto,
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
+        self.src_axis_x = self._add_entry(source, "Axis X", "0.0", 7)
+        self.src_axis_y = self._add_entry(source, "Axis Y", "0.0", 8)
+        self.src_axis_z = self._add_entry(source, "Axis Z", "-1.0", 9)
 
         # LucidShape-style size row: degree | #facets | offset | startZ
         size = ttk.LabelFrame(tab, text="Size (LucidShape)", padding=8)
@@ -318,6 +337,23 @@ class MFReflectorApp:
             EdgeRayMode.CENTER.value,
             2,
         )
+        self.uniform_intensity = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="均匀光强 / Uniform intensity (energy mapping)",
+            variable=self.uniform_intensity,
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 2))
+        ttk.Label(
+            tab,
+            text=(
+                "关闭：保持现有算法，面片参数 (u,v) 均匀映射到 H/V 角度列表。\n"
+                "开启：按朗伯入射通量做可分离映射 H(u)、V(v)，"
+                "四条边钉在设定的 H/V 矩形端点上，内部按通量加权逆校正均匀性。"
+                "θs 为相对光源光轴的出射角，θi 为入射角，r 为距离。"
+            ),
+            wraplength=660,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(10, 0))
 
     def _build_footer(self, parent: "ttk.Frame") -> None:
         footer = ttk.Frame(parent)
@@ -448,7 +484,7 @@ class MFReflectorApp:
         self.catia_status = detect_catia()
         st = self.catia_status
         self.catia_label.config(text=st.message)
-        if st.ok:
+        if st.can_send:
             self.btn_catia.config(state=tk.NORMAL)
         else:
             self.btn_catia.config(state=tk.DISABLED)
@@ -492,7 +528,18 @@ class MFReflectorApp:
         return MFReflector(
             name="UI_Reflector",
             source=PointSource(
-                position=np.array([0.0, 0.0, float(self.src_z.get())])
+                position=np.array([
+                    float(self.src_x.get()),
+                    float(self.src_y.get()),
+                    float(self.src_z.get()),
+                ]),
+                pattern=str(self.src_pattern.get()),
+                lambert_n=float(self.src_lambert_n.get()),
+                axis=None if self.src_axis_auto.get() else np.array([
+                    float(self.src_axis_x.get()),
+                    float(self.src_axis_y.get()),
+                    float(self.src_axis_z.get()),
+                ]),
             ),
             grid=GridLayout(
                 n_u=n_u,
@@ -521,6 +568,7 @@ class MFReflectorApp:
                 edge_ray=EdgeRayMode(self.edge_ray.get()),
                 h_angles=self.spread_h.get(),
                 v_angles=self.spread_v.get(),
+                uniform_intensity=bool(self.uniform_intensity.get()),
             ),
             solve=SolveMethod(self.solve.get()),
             mesh_u=max(2, int(self.samples.get())),
@@ -597,7 +645,7 @@ class MFReflectorApp:
             if not self.reflector or not self.reflector.is_generated():
                 return
         self._refresh_catia_status()
-        if not self.catia_status.ok:
+        if not self.catia_status.can_send:
             messagebox.showwarning("CATIA", self.catia_status.message)
             return
         try:

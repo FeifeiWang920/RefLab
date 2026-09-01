@@ -47,6 +47,17 @@ def test_tabbed_ui_and_dialogs():
     assert reflector.use_base_curve_from_neighbor is False
     assert reflector.z_step_u == 0.0
     assert reflector.z_step_v == 0.0
+    assert reflector.spreads.uniform_intensity is False
+    assert reflector.source.axis is None
+    app.src_axis_auto.set(False)
+    app.src_axis_x.set("1")
+    app.src_axis_y.set("0")
+    app.src_axis_z.set("0")
+    reflector = app._collect()
+    assert reflector.source.axis is not None
+    assert abs(float(reflector.source.axis[0]) - 1.0) < 1e-12
+    assert abs(float(reflector.source.axis[1])) < 1e-12
+    assert abs(float(reflector.source.axis[2])) < 1e-12
 
     root.destroy()
 

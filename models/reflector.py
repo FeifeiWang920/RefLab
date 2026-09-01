@@ -83,7 +83,8 @@ class MFReflector:
             f"size_u/v=({self.gaps.size_u:.2f}/{self.gaps.size_v:.2f})",
             f"  Spreads  : target={self.spreads.light_target.value}  "
             f"edge_ray={self.spreads.edge_ray.value}  "
-            f"H/V=({self.spreads.global_h_deg:.1f}/{self.spreads.global_v_deg:.1f})°",
+            f"H/V=({self.spreads.global_h_deg:.1f}/{self.spreads.global_v_deg:.1f})°  "
+            f"uniform_I={self.spreads.uniform_intensity}",
             f"  Solve    : {self.solve.value}  mesh={self.mesh_u}×{self.mesh_v}",
             f"  Material : R={self.reflection_coefficient:.3f}",
             f"  Facets   : {len(self.facets)} generated",

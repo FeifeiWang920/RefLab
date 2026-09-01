@@ -39,6 +39,15 @@ class CatiaStatus:
     def ok(self) -> bool:
         return self.state == CatiaState.PART_READY
 
+    @property
+    def can_send(self) -> bool:
+        """CATIA is running; a Part can be used or created on send."""
+        return self.state in (
+            CatiaState.PART_READY,
+            CatiaState.NOT_PART,
+            CatiaState.NO_ACTIVE_DOC,
+        )
+
 
 def is_available() -> bool:
     if sys.platform != "win32":
@@ -108,7 +117,10 @@ def detect_catia() -> CatiaStatus:
         except Exception:
             return CatiaStatus(
                 state=CatiaState.NOT_PART,
-                message=f"当前文档不是 Part（{name}），请打开 .CATPart",
+                message=(
+                    f"当前文档不是 Part（{name}）。"
+                    "Send 时将自动新建一个 CATPart 再导入。"
+                ),
                 document_name=name,
                 catia_version=version,
             )
@@ -296,15 +308,35 @@ def import_step_to_active_part(
                 message="CATIA 连接丢失",
             )
 
-        target_doc = catia.ActiveDocument
+        target_doc = None
         try:
-            target_part = target_doc.Part
+            if catia.Documents.Count >= 1:
+                target_doc = catia.ActiveDocument
         except Exception:
-            return CatiaStatus(
-                state=CatiaState.NOT_PART,
-                message="当前活动文档不是 Part",
-                document_name=str(getattr(target_doc, "Name", "")),
-            )
+            target_doc = None
+
+        target_part = None
+        if target_doc is not None:
+            try:
+                target_part = target_doc.Part
+            except Exception:
+                target_part = None
+
+        # Empty-gap STEP often opens as a Product. Do not refuse send —
+        # create a fresh CATPart and import into that.
+        if target_part is None:
+            try:
+                target_doc = catia.Documents.Add("Part")
+                target_part = target_doc.Part
+            except Exception as exc:
+                return CatiaStatus(
+                    state=CatiaState.NOT_PART,
+                    message=(
+                        "当前活动文档不是 Part，且无法自动新建 CATPart: "
+                        f"{exc}"
+                    ),
+                    document_name=str(getattr(target_doc, "Name", "") or ""),
+                )
         target_name = str(target_doc.Name)
 
         # ---- Open STEP (may be PartDocument or ProductDocument) ----
