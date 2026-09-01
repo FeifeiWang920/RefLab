@@ -32,11 +32,6 @@ def test_tabbed_ui_and_dialogs():
         "Spreads",
     ]
 
-    app._open_gap_dialog()
-    assert app._gap_dialog is not None and app._gap_dialog.winfo_exists()
-    app._gap_dialog.destroy()
-    root.update_idletasks()
-
     app._open_fstart_dialog()
     assert app._fstart_dialog is not None and app._fstart_dialog.winfo_exists()
     app._fstart_dialog.destroy()

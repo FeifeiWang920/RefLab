@@ -1450,19 +1450,35 @@ def _make_gap_surface(
     edge_b: np.ndarray,
     samples_u: int,
     samples_v: int,
-    degree: int = 1,
+    degree: int = 3,
 ) -> Facet:
-    """Ruled NURBS strip between two facing edges (arc-length matched)."""
+    """
+    One ruled NURBS face between two facing optical edges.
+
+    Degree-1 poles-on-samples used to produce a polyline strip (CATIA shows
+    every span as a separate brick).  Both rails are interpolated with a
+    shared knot vector so the loft is a single C2-along-the-seam surface
+    that still meets the sampled optical edges.
+    """
+    from geometry.nurbs import (
+        _chord_params,
+        _interpolate_curve,
+        _interpolating_knots,
+        open_uniform_knots,
+    )
+
     n = max(2, max(len(edge_a), len(edge_b)))
-    # Match parameterisation by arc length to avoid twisted rulings
     ea = _reparam_arc_length(edge_a, n)
     eb = _reparam_arc_length(edge_b, n)
-    ctrl = np.stack([ea, eb], axis=0)  # (2, n, 3)
+    deg_u = min(max(1, int(degree)), n - 1)
     deg_v = 1
-    deg_u = min(max(1, degree), n - 1)
-    from geometry.nurbs import open_uniform_knots
+    params = 0.5 * (_chord_params(ea) + _chord_params(eb))
+    params[0], params[-1] = 0.0, 1.0
+    knots_u = _interpolating_knots(params, deg_u)
+    ctrl_a = _interpolate_curve(ea, deg_u, params, knots_u)
+    ctrl_b = _interpolate_curve(eb, deg_u, params, knots_u)
+    ctrl = np.stack([ctrl_a, ctrl_b], axis=0)
     knots_v = open_uniform_knots(2, deg_v)
-    knots_u = open_uniform_knots(n, deg_u)
     corners = np.array([ea[0], ea[n - 1], eb[n - 1], eb[0]])
     center = corners.mean(axis=0)
     t1 = ea[n - 1] - ea[0]
@@ -1475,7 +1491,6 @@ def _make_gap_surface(
         size_u=float(np.linalg.norm(ea[n - 1] - ea[0])),
         size_v=float(np.linalg.norm(eb[0] - ea[0])),
         corners=corners,
-        # Few samples across the narrow gap → avoid ladder-looking mesh
         samples_u=max(2, n),
         samples_v=2,
         is_nurbs=True,
@@ -1718,7 +1733,7 @@ def generate_facets(
                             edge_cache[key_new]["left"],
                             su,
                             sv,
-                            degree=1,
+                            degree=max(degree_u, degree_v, 3),
                         )
                         gap_facet.index_u = iu
                         gap_facet.index_v = iv
@@ -1742,7 +1757,7 @@ def generate_facets(
                             edge_cache[key_new]["bottom"],
                             su,
                             sv,
-                            degree=1,
+                            degree=max(degree_u, degree_v, 3),
                         )
                         gap_facet.index_u = iu
                         gap_facet.index_v = iv

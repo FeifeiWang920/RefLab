@@ -2,7 +2,7 @@
 Tkinter UI for MF Reflector (v0.10 – tabbed workflow + LucidShape-style dialogs).
 
 - Multi-tab parameter editing
-- Advanced Gap and F.Start dialogs
+- F.Start dialog
 - NURBS reflector generation
 - STL / OBJ / STEP export
 - CATIA active Part integration
@@ -52,7 +52,6 @@ class MFReflectorApp:
         self.root.minsize(680, 680)
         self.reflector: Optional[MFReflector] = None
         self.catia_status: CatiaStatus = detect_catia()
-        self._gap_dialog: Optional["tk.Toplevel"] = None
         self._fstart_dialog: Optional["tk.Toplevel"] = None
         self._build_ui()
         self._refresh_catia_status()
@@ -180,10 +179,6 @@ class MFReflectorApp:
 
         self.gap_u = self._add_entry(frame, "Size U / gap [mm]", "0.2", 2)
         self.gap_v = self._add_entry(frame, "Size V / gap [mm]", "0.2", 3)
-
-        # kept for _collect compatibility (step-back disabled in simplified UI)
-        self.gap_enable = tk.BooleanVar(value=True)
-        self.gap_size_z = tk.StringVar(value="0.0")
 
         ttk.Label(
             tab,
@@ -385,49 +380,6 @@ class MFReflectorApp:
         return var
 
     # ---------------------------------------------------------------- Dialogs
-    def _open_gap_dialog(self) -> None:
-        if self._gap_dialog is not None and self._gap_dialog.winfo_exists():
-            self._gap_dialog.lift()
-            self._gap_dialog.focus_force()
-            return
-
-        dialog = tk.Toplevel(self.root)
-        self._gap_dialog = dialog
-        dialog.title("Gap Settings")
-        dialog.transient(self.root)
-        dialog.geometry("420x280")
-        dialog.resizable(False, False)
-        dialog.grab_set()
-
-        frame = ttk.Frame(dialog, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        self._add_combobox(
-            frame,
-            "Gap type",
-            [g.value for g in GapType],
-            self.gap_type.get(),
-            0,
-        )
-        self._add_combobox(
-            frame,
-            "Surface mode",
-            [m.value for m in GapSurfaceMode],
-            self.gap_mode.get(),
-            1,
-        )
-        self._add_entry(frame, "Step-back Z [mm]", self.gap_size_z.get(), 2, 18)
-
-        ttk.Label(
-            frame,
-            text="Step-back Z is used by step back / step back + no gap types.",
-            wraplength=360,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=0, columnspan=2, sticky=tk.E, pady=(16, 0))
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-
     def _open_fstart_dialog(self) -> None:
         if self._fstart_dialog is not None and self._fstart_dialog.winfo_exists():
             self._fstart_dialog.lift()
