@@ -231,9 +231,9 @@ def test_uniform_intensity_kills_offaxis_keystone():
     smile = float(vs[0, mid] - 0.5 * (vs[0, 0] + vs[0, -1]))
     # Off-axis 20×20 / f=8 still has a few degrees of H keystone; the
     # smile (bottom V corners vs centre) is what FFD over-produced.
-    assert abs(top - bot) < 8.0
-    assert abs(top - 40.0) < 6.0
-    assert abs(bot - 40.0) < 8.0
+    assert abs(top - bot) < 5.0
+    assert abs(top - 40.0) < 4.0
+    assert abs(bot - 40.0) < 5.0
     assert abs(smile) < 2.5
     assert float(vs.max()) <= 12.0
     assert float(vs.min()) >= -14.0

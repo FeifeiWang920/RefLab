@@ -1674,6 +1674,40 @@ def _spatial_intensity_inverse(
     def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
         return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
 
+    return _row_h_preemphasis(fn, realized_h, h0, h1, gain=0.55)
+
+
+def _row_h_preemphasis(
+    inner_fn,
+    realized_h: np.ndarray,
+    h0: float,
+    h1: float,
+    gain: float = 0.55,
+):
+    """
+    Per-row H-span calibration in angle space.
+
+    Off-axis LS realizes a slightly wider top than bottom.  Scale each
+    row's asked H toward (h1-h0)/realized_span so the next solve
+    straightens the sides without a z-space warp.
+    """
+    rh = np.asarray(realized_h, dtype=float)
+    nv = rh.shape[0]
+    want = float(h1) - float(h0)
+    got = rh[:, -1] - rh[:, 0]
+    scale = np.ones(nv, dtype=float)
+    ok = np.abs(got) > 1e-6
+    scale[ok] = want / got[ok]
+    scale = 1.0 + float(gain) * (scale - 1.0)
+    scale = np.clip(scale, 0.90, 1.10)
+    mid = 0.5 * (float(h0) + float(h1))
+    half = 0.5 * abs(want) * 1.12
+
+    def fn(li: int, lj: int, inner=inner_fn, sc=scale, mid=mid, half=half):
+        h, v = inner(li, lj)
+        s = float(sc[int(np.clip(lj, 0, sc.size - 1))])
+        return float(np.clip(mid + s * (h - mid), mid - half, mid + half)), v
+
     return fn
 
 
