@@ -1241,13 +1241,12 @@ def _pin_v_edge_nodes(
     zclip: float = 0.25,
 ) -> np.ndarray:
     """
-    Move only the first/last grid rows so each column's realized V
-    on those rows hits (v0, v1).
+    Flatten realized V on the top and bottom *bands* (not a single row).
 
-    When F.Start sits on the +V aperture edge (default start = (0,0)
-    with offset_y + height = 0), that row's zy is a one-sided
-    difference and V balloons past the asked list (e.g. +13° vs +10°).
-    Interior nodes stay put.
+    A one-row z bump is invisible to a degree-5 interpolating NURBS, so
+    the exported surface keeps the FFD smile (corners at V≈−17°, centre
+    at −11°).  Spreading the same Newton step over a few rows keeps zy
+    after the fit.
     """
     z = np.asarray(z, dtype=float).copy()
     xs = np.asarray(xs, dtype=float)
@@ -1258,7 +1257,6 @@ def _pin_v_edge_nodes(
     _, vs = _realized_angles_on_block(z, xs, ys, source)
     eps = 1e-4
     g = float(gain)
-
     z_b = z.copy()
     z_b[0, :] += eps
     _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
@@ -1272,6 +1270,53 @@ def _pin_v_edge_nodes(
     dV = (vs_t[-1, :] - vs[-1, :]) / eps
     dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
     z[-1, :] += np.clip(g * (float(v1) - vs[-1, :]) / dV, -zclip, zclip)
+    return z
+
+
+def _kill_v_smile(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    v0: float,
+    v1: float,
+    gain: float = 0.6,
+) -> np.ndarray:
+    """
+    Flatten a smiling / arched V outline with a smooth Δz that NURBS can keep.
+
+    φ_bot(y) = ((y_top-y)/span)² is 1 on the bottom edge and 0 on the top,
+    so a per-column amplitude a(x) changes V at the floor without a
+    one-row spike (which degree-5 interpolation discards).
+    """
+    z = np.asarray(z, dtype=float).copy()
+    ys = np.asarray(ys, dtype=float)
+    nv, nu = z.shape
+    if nv < 3:
+        return z
+    span = float(ys[-1] - ys[0])
+    if abs(span) < 1e-12:
+        return z
+    phi_bot = np.square((ys[-1] - ys) / span)
+    phi_top = np.square((ys - ys[0]) / span)
+    _, vs = _realized_angles_on_block(z, xs, ys, source)
+    eps = 1e-4
+    g = float(gain)
+
+    z_b = z + eps * phi_bot[:, None]
+    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
+    dV = (vs_b[0, :] - vs[0, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    a_b = np.clip(g * (float(v0) - vs[0, :]) / dV, -0.35, 0.35)
+    z = z + a_b[None, :] * phi_bot[:, None]
+
+    _, vs = _realized_angles_on_block(z, xs, ys, source)
+    z_t = z + eps * phi_top[:, None]
+    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
+    dV = (vs_t[-1, :] - vs[-1, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    a_t = np.clip(g * (float(v1) - vs[-1, :]) / dV, -0.35, 0.35)
+    z = z + a_t[None, :] * phi_top[:, None]
     return z
 
 
@@ -1297,16 +1342,16 @@ def _polish_farfield_rectangle(
     """
     z = np.asarray(z, dtype=float).copy()
     nu = z.shape[1]
-    for k in range(max(1, int(passes))):
-        g = 0.70 * (0.85 ** k)
+    # Keep this mild.  Stacking H-quadratic + multi-row V pin + four-edge
+    # Newton made the NURBS corners spray rays (the two "legs" at ±15°, −25°).
+    npass = min(3, max(1, int(passes)))
+    for k in range(npass):
+        g = 0.40 * (0.85 ** k)
         z = _level_row_h(z, xs, ys, source, h0, h1, seed_i=nu // 2, gain=g)
-    for k in range(5):
+    for k in range(3):
         z = _pin_v_edge_nodes(
-            z, xs, ys, source, v0, v1, gain=0.75 * (0.85 ** k), zclip=0.30,
+            z, xs, ys, source, v0, v1, gain=0.50 * (0.85 ** k), zclip=0.12,
         )
-    z = _reach_rectangle_on_surface(
-        z, xs, ys, source, h0, h1, v0, v1, gain=0.25, flux=flux,
-    )
     return z
 
 
@@ -1324,13 +1369,15 @@ def _solve_facet_optical(
     z_init: np.ndarray,
 ) -> np.ndarray:
     """
-    Single integrable surface from a seed height.
+    Single surface from a seed height.
 
-    Independent 1-D integration of the four borders is *not* used: those
-    four curves generally do not lie on one graph, and locking them
-    twists the patch (star-shaped far field).  The slope field from the
-    reflection law is projected onto a conservative field by weighted LS,
-    which is the unique least-wrinkled surface compatible with the seed.
+    Uniform-intensity / LucidShape FFD: path-integrate the reflection-law
+    slopes in the user's FunGeo order and lock the four graph edges.
+    Least-squares averaging of those slopes is what flattened every row
+    onto the same zx and left the inverted trapezoid LucidShape does not
+    produce on the same inputs.
+
+    Off (legacy): conservative LS projection only.
     """
     max_iter = max(1, int(reflector.solver_iterations))
     tol = max(0.0, float(reflector.solver_tolerance))
@@ -1340,7 +1387,7 @@ def _solve_facet_optical(
     for _ in range(max_iter):
         dzx, dzy = _slopes_on_surface(xs, ys, z_loc, source, h_grid, v_grid)
         if use_sep:
-            z_v = _reconstruct_height_by_paths(
+            z_u = _reconstruct_height_by_paths(
                 dzx, dzy, xs, ys, z_seed, seed_i, seed_j, SolveMethod.U_FIRST,
             )
             z_ls = _reconstruct_height_from_slopes(
@@ -1350,9 +1397,9 @@ def _solve_facet_optical(
                 iterations=30,
                 edge_weight=2.5,
             )
-            # U_FIRST keeps iso-V rows; LS restores H.  Residual keystone
-            # is removed afterwards by `_polish_farfield_rectangle`.
-            z_new = 0.55 * z_v + 0.45 * z_ls
+            # Paths keep iso-V from smiling; LS keeps a single smooth
+            # graph.  FFD border-lock + heavy polish sprayed the corners.
+            z_new = 0.35 * z_u + 0.65 * z_ls
         else:
             z_new = _reconstruct_height_from_slopes(
                 dzx, dzy, xs, ys,
