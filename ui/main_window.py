@@ -387,12 +387,18 @@ class MFReflectorApp:
         self,
         parent,
         label: str,
-        default: str,
+        default,
         row: int,
         width: int = 18,
     ) -> "tk.StringVar":
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
-        var = tk.StringVar(value=default)
+        # Reuse an existing StringVar when the caller passes one (F.Start
+        # dialog).  A fresh var from `.get()` would display the value but
+        # never write back into `_collect()`.
+        if isinstance(default, tk.StringVar):
+            var = default
+        else:
+            var = tk.StringVar(value=str(default))
         ttk.Entry(parent, textvariable=var, width=width).grid(
             row=row, column=1, sticky=tk.W, padx=4, pady=2
         )
@@ -415,6 +421,51 @@ class MFReflectorApp:
         parent.columnconfigure(0, weight=1)
         return var
 
+    def _aperture_bounds(self) -> tuple[float, float, float, float]:
+        """Current Grid & Source aperture rectangle (x0, x1, y0, y1)."""
+        n_u = max(1, int(float(self.n_u.get())))
+        n_v = max(1, int(float(self.n_v.get())))
+        widths = self._parse_deltas(self.width_deltas.get(), n_u)
+        heights = self._parse_deltas(self.height_deltas.get(), n_v)
+        x0 = float(self.offset_x.get())
+        y0 = float(self.offset_y.get())
+        return x0, x0 + float(sum(widths)), y0, y0 + float(sum(heights))
+
+    def _dialog_action_bar(
+        self,
+        dialog: "tk.Toplevel",
+        on_apply,
+        status_var: "tk.StringVar",
+    ) -> None:
+        """
+        Footer pinned to the bottom of the Toplevel so Apply/OK/Close
+        stay visible even when the form above is tall.
+        """
+        footer = ttk.Frame(dialog, padding=(12, 8, 12, 12))
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Separator(footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(footer, textvariable=status_var, foreground="#1a5f2a").pack(
+            anchor=tk.W, pady=(0, 8)
+        )
+
+        buttons = ttk.Frame(footer)
+        buttons.pack(fill=tk.X)
+
+        def apply_and_close() -> None:
+            if on_apply():
+                dialog.destroy()
+
+        ttk.Button(buttons, text="Apply", command=on_apply, width=10).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(buttons, text="OK", command=apply_and_close, width=10).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(buttons, text="Close", command=dialog.destroy, width=10).pack(
+            side=tk.RIGHT
+        )
+
     # ---------------------------------------------------------------- Dialogs
     def _open_fstart_dialog(self) -> None:
         if self._fstart_dialog is not None and self._fstart_dialog.winfo_exists():
@@ -426,57 +477,135 @@ class MFReflectorApp:
         self._fstart_dialog = dialog
         dialog.title("F.Start")
         dialog.transient(self.root)
-        dialog.geometry("480x430")
-        dialog.resizable(False, False)
+        dialog.minsize(460, 420)
+        dialog.geometry("520x620")
+        dialog.resizable(True, True)
         dialog.grab_set()
 
-        frame = ttk.Frame(dialog, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
+        # Draft copies: typing does nothing until Apply / OK.
+        d_use_start = tk.BooleanVar(value=self.use_start_point.get())
+        d_start_x = tk.StringVar(value=self.start_x.get())
+        d_start_y = tk.StringVar(value=self.start_y.get())
+        d_start_auto = tk.BooleanVar(value=self.start_auto.get())
+        d_calc_u = tk.StringVar(value=self.calc_start_u.get())
+        d_calc_v = tk.StringVar(value=self.calc_start_v.get())
+        d_ref_u = tk.StringVar(value=self.reference_u.get())
+        d_ref_v = tk.StringVar(value=self.reference_v.get())
+        d_neighbor = tk.BooleanVar(value=self.use_neighbor_curve.get())
+        d_z_u = tk.StringVar(value=self.z_step_u.get())
+        d_z_v = tk.StringVar(value=self.z_step_v.get())
+        status = tk.StringVar(value="Not applied — click Apply to send into Generate.")
+
+        def apply_fstart() -> bool:
+            try:
+                sx = float(d_start_x.get())
+                sy = float(d_start_y.get())
+                cu = float(d_calc_u.get())
+                cv = float(d_calc_v.get())
+                ru = float(d_ref_u.get())
+                rv = float(d_ref_v.get())
+                zu = float(d_z_u.get())
+                zv = float(d_z_v.get())
+            except ValueError:
+                messagebox.showerror(
+                    "F.Start",
+                    "All numeric fields must be valid numbers.",
+                    parent=dialog,
+                )
+                return False
+            if d_use_start.get():
+                try:
+                    x0, x1, y0, y1 = self._aperture_bounds()
+                except Exception as exc:
+                    messagebox.showerror("F.Start", f"Cannot read the grid: {exc}", parent=dialog)
+                    return False
+                pad = 1e-9
+                if not (x0 - pad <= sx <= x1 + pad and y0 - pad <= sy <= y1 + pad):
+                    messagebox.showerror(
+                        "F.Start",
+                        f"Start ({sx:.3f}, {sy:.3f}) is outside the aperture\n"
+                        f"X {x0:.1f}…{x1:.1f}, Y {y0:.1f}…{y1:.1f}.",
+                        parent=dialog,
+                    )
+                    return False
+            self.use_start_point.set(d_use_start.get())
+            self.start_x.set(f"{sx:g}")
+            self.start_y.set(f"{sy:g}")
+            self.start_auto.set(d_start_auto.get())
+            self.calc_start_u.set(f"{cu:g}")
+            self.calc_start_v.set(f"{cv:g}")
+            self.reference_u.set(f"{ru:g}")
+            self.reference_v.set(f"{rv:g}")
+            self.use_neighbor_curve.set(d_neighbor.get())
+            self.z_step_u.set(f"{zu:g}")
+            self.z_step_v.set(f"{zv:g}")
+            if d_use_start.get():
+                status.set(f"Applied — start ({sx:g}, {sy:g}). Generate to rebuild.")
+            else:
+                status.set("Applied — global start off, using U/V. Generate to rebuild.")
+            return True
+
+        # Footer first so Apply stays on screen when the form is tall.
+        self._dialog_action_bar(dialog, apply_fstart, status)
+
+        body = ttk.Frame(dialog, padding=(12, 12, 12, 0))
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        frame = body
 
         grid_group = ttk.LabelFrame(frame, text="Grid Start Point", padding=8)
         grid_group.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
         ttk.Checkbutton(
             grid_group,
             text="Use global start point",
-            variable=self.use_start_point,
+            variable=d_use_start,
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(grid_group, "Start X [mm]", self.start_x.get(), 1, 18)
-        self._add_entry(grid_group, "Start Y [mm]", self.start_y.get(), 2, 18)
+        self._add_entry(grid_group, "Start X [mm]", d_start_x, 1, 18)
+        self._add_entry(grid_group, "Start Y [mm]", d_start_y, 2, 18)
+        try:
+            x0, x1, y0, y1 = self._aperture_bounds()
+            bounds = (
+                f"Must lie inside the current aperture: "
+                f"X {x0:.1f}…{x1:.1f}, Y {y0:.1f}…{y1:.1f}. "
+                f"Centre is ({0.5 * (x0 + x1):.1f}, {0.5 * (y0 + y1):.1f})."
+            )
+        except Exception:
+            bounds = "Must lie inside the aperture on the Grid & Source tab."
+        ttk.Label(grid_group, text=bounds, wraplength=450, justify=tk.LEFT).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+        )
 
         calc_group = ttk.LabelFrame(frame, text="Facet Calculation Start", padding=8)
         calc_group.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
         ttk.Checkbutton(
             calc_group,
             text="Automatic (use reference position)",
-            variable=self.start_auto,
+            variable=d_start_auto,
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(calc_group, "Start U [0..1]", self.calc_start_u.get(), 1, 18)
-        self._add_entry(calc_group, "Start V [0..1]", self.calc_start_v.get(), 2, 18)
-        self._add_entry(calc_group, "Reference U [0..1]", self.reference_u.get(), 3, 18)
-        self._add_entry(calc_group, "Reference V [0..1]", self.reference_v.get(), 4, 18)
+        self._add_entry(calc_group, "Start U [0..1]", d_calc_u, 1, 18)
+        self._add_entry(calc_group, "Start V [0..1]", d_calc_v, 2, 18)
+        self._add_entry(calc_group, "Reference U [0..1]", d_ref_u, 3, 18)
+        self._add_entry(calc_group, "Reference V [0..1]", d_ref_v, 4, 18)
 
         neighbor_group = ttk.LabelFrame(frame, text="Boundary & Z Steps", padding=8)
         neighbor_group.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
         ttk.Checkbutton(
             neighbor_group,
             text="Use base curve from neighbor",
-            variable=self.use_neighbor_curve,
+            variable=d_neighbor,
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(neighbor_group, "Z step U [mm]", self.z_step_u.get(), 1, 18)
-        self._add_entry(neighbor_group, "Z step V [mm]", self.z_step_v.get(), 2, 18)
+        self._add_entry(neighbor_group, "Z step U [mm]", d_z_u, 1, 18)
+        self._add_entry(neighbor_group, "Z step V [mm]", d_z_v, 2, 18)
         ttk.Label(
             neighbor_group,
             text="Off: facets keep their exact optical spread and connect only at "
                  "the reference point (recommended — spot range = settings).\n"
                  "On: the shared edge curve is forced identical (watertight), but "
                  "the facet optics bend near that border.",
-            wraplength=430,
+            wraplength=450,
             justify=tk.LEFT,
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(14, 0))
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
     # ------------------------------------------------------------------ CATIA

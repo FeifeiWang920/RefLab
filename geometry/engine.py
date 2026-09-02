@@ -1019,6 +1019,19 @@ def _build_height_field(reflector: MFReflector):
             residual_targets[key] = fn
         cal_blocks = new_inv
 
+    if use_energy:
+        for key, blk in list(cal_blocks.items()):
+            iu, iv = key
+            xs, ys = facet_grids[key]
+            h0, _ = spreads.target_angles_on_facet(iu, iv, 0.0, 0.5)
+            h1, _ = spreads.target_angles_on_facet(iu, iv, 1.0, 0.5)
+            _, v0 = spreads.target_angles_on_facet(iu, iv, 0.5, 0.0)
+            _, v1 = spreads.target_angles_on_facet(iu, iv, 0.5, 1.0)
+            flux = _incident_flux_weights(xs, ys, blk, source, **energy_kw)
+            cal_blocks[key] = _polish_farfield_rectangle(
+                blk, xs, ys, source, h0, h1, v0, v1, flux=flux, passes=6,
+            )
+
     # ------------------------------------------------------------------
     # Pass 3: neighbour influence.
     # ------------------------------------------------------------------
@@ -1106,6 +1119,197 @@ def _build_height_field(reflector: MFReflector):
 # ---------------------------------------------------------------------------
 
 
+def _level_row_h(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    h0: float,
+    h1: float,
+    seed_i: int,
+    gain: float = 0.45,
+) -> np.ndarray:
+    """
+    Per-row H-endpoint correction.
+
+    A linear Δz = s(y)·(x-xmid) only *shifts* the whole row in H
+    (Δzx is constant).  The inverted-trapezoid error is a *span*
+    error, so we also add a quadratic stretch
+        Δz = c(y)·(x-xmid)²
+    which gives opposite Δzx on the two H edges.  A 2×2 Newton per
+    row solves (shift, stretch) so both endpoints approach (h0, h1).
+    """
+    z = np.asarray(z, dtype=float).copy()
+    xs = np.asarray(xs, dtype=float)
+    nv, nu = z.shape
+    if nu < 3:
+        return z
+    mid_i = nu // 2
+    seed_i = int(np.clip(mid_i if seed_i is None else seed_i, 0, nu - 1))
+    lever = xs - xs[seed_i]
+    quad = lever * lever
+    hs, _ = _realized_angles_on_block(z, xs, ys, source)
+    eps_s, eps_c = 1e-4, 1e-5
+    hs_s, _ = _realized_angles_on_block(z + eps_s * lever[None, :], xs, ys, source)
+    hs_c, _ = _realized_angles_on_block(z + eps_c * quad[None, :], xs, ys, source)
+    Js0 = (hs_s[:, 0] - hs[:, 0]) / eps_s
+    Js1 = (hs_s[:, -1] - hs[:, -1]) / eps_s
+    Jc0 = (hs_c[:, 0] - hs[:, 0]) / eps_c
+    Jc1 = (hs_c[:, -1] - hs[:, -1]) / eps_c
+    e0 = float(h0) - hs[:, 0]
+    e1 = float(h1) - hs[:, -1]
+    g = float(gain)
+    span = float(np.max(np.abs(xs)) + 1.0)
+    s = np.zeros(nv, dtype=float)
+    c = np.zeros(nv, dtype=float)
+    for j in range(nv):
+        A = np.array([[Js0[j], Jc0[j]], [Js1[j], Jc1[j]]], dtype=float)
+        try:
+            det = float(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
+        except Exception:
+            det = 0.0
+        if abs(det) < 1e-10:
+            continue
+        sc = np.linalg.solve(A, np.array([e0[j], e1[j]], dtype=float))
+        s[j] = sc[0]
+        c[j] = sc[1]
+    s = np.clip(g * s, -0.20, 0.20)
+    c = np.clip(g * c, -0.20 / max(span, 1.0), 0.20 / max(span, 1.0))
+    z += s[:, None] * lever[None, :] + c[:, None] * quad[None, :]
+    return z
+
+
+def _level_col_v(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    v0: float,
+    v1: float,
+    seed_j: int,
+    gain: float = 0.45,
+) -> np.ndarray:
+    """
+    Per-column V-endpoint correction (shift + quadratic stretch).
+    Symmetric of `_level_row_h`.
+    """
+    z = np.asarray(z, dtype=float).copy()
+    ys = np.asarray(ys, dtype=float)
+    nv, nu = z.shape
+    if nv < 3:
+        return z
+    mid_j = nv // 2
+    seed_j = int(np.clip(mid_j if seed_j is None else seed_j, 0, nv - 1))
+    lever = ys - ys[seed_j]
+    quad = lever * lever
+    _, vs = _realized_angles_on_block(z, xs, ys, source)
+    eps_s, eps_c = 1e-4, 1e-5
+    _, vs_s = _realized_angles_on_block(z + eps_s * lever[:, None], xs, ys, source)
+    _, vs_c = _realized_angles_on_block(z + eps_c * quad[:, None], xs, ys, source)
+    Js0 = (vs_s[0, :] - vs[0, :]) / eps_s
+    Js1 = (vs_s[-1, :] - vs[-1, :]) / eps_s
+    Jc0 = (vs_c[0, :] - vs[0, :]) / eps_c
+    Jc1 = (vs_c[-1, :] - vs[-1, :]) / eps_c
+    e0 = float(v0) - vs[0, :]
+    e1 = float(v1) - vs[-1, :]
+    g = float(gain)
+    span = float(np.max(np.abs(ys)) + 1.0)
+    s = np.zeros(nu, dtype=float)
+    c = np.zeros(nu, dtype=float)
+    for i in range(nu):
+        A = np.array([[Js0[i], Jc0[i]], [Js1[i], Jc1[i]]], dtype=float)
+        det = float(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
+        if abs(det) < 1e-10:
+            continue
+        sc = np.linalg.solve(A, np.array([e0[i], e1[i]], dtype=float))
+        s[i] = sc[0]
+        c[i] = sc[1]
+    s = np.clip(g * s, -0.20, 0.20)
+    c = np.clip(g * c, -0.20 / max(span, 1.0), 0.20 / max(span, 1.0))
+    z += s[None, :] * lever[:, None] + c[None, :] * quad[:, None]
+    return z
+
+
+def _pin_v_edge_nodes(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    v0: float,
+    v1: float,
+    gain: float = 0.7,
+    zclip: float = 0.25,
+) -> np.ndarray:
+    """
+    Move only the first/last grid rows so each column's realized V
+    on those rows hits (v0, v1).
+
+    When F.Start sits on the +V aperture edge (default start = (0,0)
+    with offset_y + height = 0), that row's zy is a one-sided
+    difference and V balloons past the asked list (e.g. +13° vs +10°).
+    Interior nodes stay put.
+    """
+    z = np.asarray(z, dtype=float).copy()
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    nv, nu = z.shape
+    if nv < 2:
+        return z
+    _, vs = _realized_angles_on_block(z, xs, ys, source)
+    eps = 1e-4
+    g = float(gain)
+
+    z_b = z.copy()
+    z_b[0, :] += eps
+    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
+    dV = (vs_b[0, :] - vs[0, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    z[0, :] += np.clip(g * (float(v0) - vs[0, :]) / dV, -zclip, zclip)
+
+    z_t = z.copy()
+    z_t[-1, :] += eps
+    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
+    dV = (vs_t[-1, :] - vs[-1, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    z[-1, :] += np.clip(g * (float(v1) - vs[-1, :]) / dV, -zclip, zclip)
+    return z
+
+
+def _polish_farfield_rectangle(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    h0: float,
+    h1: float,
+    v0: float,
+    v1: float,
+    flux: Optional[np.ndarray] = None,
+    passes: int = 6,
+) -> np.ndarray:
+    """
+    Surface-space outline lock.
+
+    1. Per-row H shift+stretch kills the off-axis inverted trapezoid.
+    2. Pin first/last V rows to (Vmin, Vmax).  Needed when F.Start
+       sits on the +V edge and that row overshoots the angle list.
+    3. Light four-edge Newton cleans leftover corner errors.
+    """
+    z = np.asarray(z, dtype=float).copy()
+    nu = z.shape[1]
+    for k in range(max(1, int(passes))):
+        g = 0.70 * (0.85 ** k)
+        z = _level_row_h(z, xs, ys, source, h0, h1, seed_i=nu // 2, gain=g)
+    for k in range(5):
+        z = _pin_v_edge_nodes(
+            z, xs, ys, source, v0, v1, gain=0.75 * (0.85 ** k), zclip=0.30,
+        )
+    z = _reach_rectangle_on_surface(
+        z, xs, ys, source, h0, h1, v0, v1, gain=0.25, flux=flux,
+    )
+    return z
+
+
 def _solve_facet_optical(
     reflector: MFReflector,
     xs: np.ndarray,
@@ -1146,8 +1350,8 @@ def _solve_facet_optical(
                 iterations=30,
                 edge_weight=2.5,
             )
-            # U_FIRST levels iso-V (bottom contour) but overshoots H.
-            # A little LS pulls H back toward the asked rectangle.
+            # U_FIRST keeps iso-V rows; LS restores H.  Residual keystone
+            # is removed afterwards by `_polish_farfield_rectangle`.
             z_new = 0.55 * z_v + 0.45 * z_ls
         else:
             z_new = _reconstruct_height_from_slopes(

@@ -1,10 +1,10 @@
 """
 mf_reflector – Python implementation of LucidShape MacroFocal Reflector core.
 
-Version: 0.9.6 (redesigned from official FunGeo MacroFocal 2024.09 documentation)
+Version: 0.9.7 (redesigned from official FunGeo MacroFocal 2024.09 documentation)
 """
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 from .models import (
     MFReflector,

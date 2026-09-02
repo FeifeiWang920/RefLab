@@ -199,6 +199,43 @@ def test_uniform_intensity_changes_surface_when_flux_varies():
     assert not np.allclose(w_iso, w_lam)
 
 
+def test_uniform_intensity_kills_offaxis_keystone():
+    """Off-axis LED + rectangular spread must not stay an inverted trapezoid."""
+    engine = __import__(
+        "geometry.engine",
+        fromlist=["_build_height_field", "_realized_angles_on_block"],
+    )
+    r = _reflector(1, 1)
+    r.source = PointSource(
+        position=np.array([0.0, 0.0, 0.0]),
+        axis=np.array([0.0, -1.0, 0.0]),
+        pattern="lambertian",
+        lambert_n=1.0,
+    )
+    r.grid.width_deltas = [20.0]
+    r.grid.height_deltas = [20.0]
+    r.grid.offset_x = -10.0
+    r.grid.offset_y = -20.0
+    r.grid.focal = 8.0
+    r.spreads.h_angles = [-20.0, 20.0]
+    r.spreads.v_angles = [-10.0, 10.0]
+    r.spreads.uniform_intensity = True
+    r.mesh_u = 21
+    r.mesh_v = 21
+    r.solver_iterations = 5
+    xs, ys, z, su, sv, blocks = engine._build_height_field(r)
+    hs, vs = engine._realized_angles_on_block(blocks[(0, 0)], xs, ys, r.source.position)
+    top = float(hs[-1, -1] - hs[-1, 0])
+    bot = float(hs[0, -1] - hs[0, 0])
+    # Uncorrected off-axis case is ~8° of keystone; polish should kill most of it.
+    assert abs(top - bot) < 2.5
+    assert abs(top - 40.0) < 3.0
+    assert abs(bot - 40.0) < 4.0
+    # Default F.Start on the +V aperture edge used to balloon V to ~+13°.
+    assert float(vs.max()) <= 11.0
+    assert float(vs.min()) >= -12.0
+
+
 def test_source_axis_xyz_overrides_auto():
     engine = __import__("geometry.engine", fromlist=["_source_emission_axis"])
     r = _reflector(1, 1)
