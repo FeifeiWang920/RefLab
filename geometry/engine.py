@@ -669,6 +669,45 @@ def _fair_height_block(z: np.ndarray, iterations: int = 12, strength: float = 0.
     return out
 
 
+def _reconstruct_height_separable(
+    dzx: np.ndarray,
+    dzy: np.ndarray,
+    x_coords: Sequence[float],
+    y_coords: Sequence[float],
+    z_seed: float,
+    seed_i: int,
+    seed_j: int,
+) -> np.ndarray:
+    """
+    Integrable graph z = z_seed + F(x) + G(y).
+
+    Crossed-rays-off FFD: zx depends only on x, zy only on y, so every
+    column has the same V travel and the bottom iso-V stays level.
+    Target slopes are averaged to a conservative separable field, then
+    integrated from the seed.  No LS projection, no 2-D angle warp.
+    """
+    dzx = np.asarray(dzx, dtype=float)
+    dzy = np.asarray(dzy, dtype=float)
+    xs = np.asarray(x_coords, dtype=float)
+    ys = np.asarray(y_coords, dtype=float)
+    nv, nu = dzx.shape
+    seed_i = int(np.clip(seed_i, 0, nu - 1))
+    seed_j = int(np.clip(seed_j, 0, nv - 1))
+    fx = dzx.mean(axis=0)
+    gy = dzy.mean(axis=1)
+    F = np.zeros(nu, dtype=float)
+    G = np.zeros(nv, dtype=float)
+    for i in range(seed_i + 1, nu):
+        F[i] = F[i - 1] + 0.5 * (fx[i] + fx[i - 1]) * (xs[i] - xs[i - 1])
+    for i in range(seed_i - 1, -1, -1):
+        F[i] = F[i + 1] + 0.5 * (fx[i] + fx[i + 1]) * (xs[i] - xs[i + 1])
+    for j in range(seed_j + 1, nv):
+        G[j] = G[j - 1] + 0.5 * (gy[j] + gy[j - 1]) * (ys[j] - ys[j - 1])
+    for j in range(seed_j - 1, -1, -1):
+        G[j] = G[j + 1] + 0.5 * (gy[j] + gy[j + 1]) * (ys[j] - ys[j + 1])
+    return float(z_seed) + F[None, :] + G[:, None]
+
+
 def _reconstruct_height_from_slopes(
     dzx: np.ndarray,
     dzy: np.ndarray,
@@ -931,9 +970,8 @@ def _build_height_field(reflector: MFReflector):
     cal_blocks = new_blocks
 
     # ------------------------------------------------------------------
-    # Off: one angle-profile inverse (legacy).
-    # On: FFD-style spatial iterations — equalize flux vs realized
-    # (H,V), rebuild by LS, repeat.  target_min floors empty bins.
+    # One inverse pass.  LucidShape FFD spatial-iterations default is 1;
+    # the rectangle has to come from the first surface, not from looping.
     # ------------------------------------------------------------------
     residual_targets: Dict[Tuple[int, int], object] = {}
     n_spatial = 5 if use_energy else 1
@@ -1094,20 +1132,57 @@ def _solve_facet_optical(
     tol = max(0.0, float(reflector.solver_tolerance))
     z_loc = np.asarray(z_init, dtype=float).copy()
     h_grid, v_grid = _eval_target_grid(target_fn, su, sv)
+    use_sep = bool(getattr(reflector.spreads, "uniform_intensity", False))
     for _ in range(max_iter):
         dzx, dzy = _slopes_on_surface(xs, ys, z_loc, source, h_grid, v_grid)
-        z_new = _reconstruct_height_from_slopes(
-            dzx, dzy, xs, ys,
-            z_seed=z_seed,
-            seed_i=seed_i, seed_j=seed_j,
-            iterations=30,
-            edge_weight=2.5,
-        )
+        if use_sep:
+            z_v = _reconstruct_height_by_paths(
+                dzx, dzy, xs, ys, z_seed, seed_i, seed_j, SolveMethod.U_FIRST,
+            )
+            z_ls = _reconstruct_height_from_slopes(
+                dzx, dzy, xs, ys,
+                z_seed=z_seed,
+                seed_i=seed_i, seed_j=seed_j,
+                iterations=30,
+                edge_weight=2.5,
+            )
+            # U_FIRST levels iso-V (bottom contour) but overshoots H.
+            # A little LS pulls H back toward the asked rectangle.
+            z_new = 0.55 * z_v + 0.45 * z_ls
+        else:
+            z_new = _reconstruct_height_from_slopes(
+                dzx, dzy, xs, ys,
+                z_seed=z_seed,
+                seed_i=seed_i, seed_j=seed_j,
+                iterations=30,
+                edge_weight=2.5,
+            )
         delta = float(np.max(np.abs(z_new - z_loc)))
         z_loc = z_new
         if delta <= tol:
             break
     return z_loc
+
+
+def _double_coords(coords: np.ndarray) -> np.ndarray:
+    c = np.asarray(coords, dtype=float)
+    out = np.empty(c.size * 2 - 1, dtype=float)
+    out[::2] = c
+    out[1::2] = 0.5 * (c[:-1] + c[1:])
+    return out
+
+
+def _double_field(field: np.ndarray) -> np.ndarray:
+    a = np.asarray(field, dtype=float)
+    nv, nu = a.shape
+    out = np.empty((nv * 2 - 1, nu * 2 - 1), dtype=float)
+    out[::2, ::2] = a
+    out[::2, 1::2] = 0.5 * (a[:, :-1] + a[:, 1:])
+    out[1::2, ::2] = 0.5 * (a[:-1, :] + a[1:, :])
+    out[1::2, 1::2] = 0.25 * (
+        a[:-1, :-1] + a[:-1, 1:] + a[1:, :-1] + a[1:, 1:]
+    )
+    return out
 
 
 def _realized_angles_on_block(
@@ -1153,6 +1228,105 @@ def _realized_angles_on_block(
     hs = np.where(valid, hs, 0.0)
     vs = np.where(valid, vs, 0.0)
     return hs, vs
+
+
+def _intensity_scale_field(
+    hs: np.ndarray,
+    vs: np.ndarray,
+    flux: Optional[np.ndarray],
+    h0: float,
+    h1: float,
+    v0: float,
+    v1: float,
+    target_min: float = 0.1,
+) -> np.ndarray:
+    """I_tgt / I(H,V) per node.  Dark bins (>1) get a larger Δz push."""
+    shape = np.asarray(hs).shape
+    scale = np.ones(shape, dtype=float)
+    if flux is None:
+        return scale
+    w = np.maximum(np.asarray(flux, dtype=float), 0.0)
+    hr = np.asarray(hs, dtype=float).ravel()
+    vr = np.asarray(vs, dtype=float).ravel()
+    wr = w.ravel()
+    if wr.size == 0 or float(np.max(wr)) <= 0.0:
+        return scale
+    h_lo, h_hi = (h0, h1) if h0 <= h1 else (h1, h0)
+    v_lo, v_hi = (v0, v1) if v0 <= v1 else (v1, v0)
+    nh, nv = 20, 12
+    he = np.linspace(h_lo, h_hi, nh + 1)
+    ve = np.linspace(v_lo, v_hi, nv + 1)
+    hist, _, _ = np.histogram2d(hr, vr, bins=[he, ve], weights=wr)
+    dA = abs((he[1] - he[0]) * (ve[1] - ve[0])) + 1e-30
+    Imap = hist / dA
+    peak = float(np.max(Imap))
+    I_tgt = float(np.sum(wr)) / max(abs((h_hi - h_lo) * (v_hi - v_lo)), 1e-9)
+    floor = (target_min * peak) if peak > 0.0 else I_tgt
+    I_tgt = max(I_tgt, floor)
+    ih = np.clip(np.digitize(hs, he) - 1, 0, nh - 1)
+    iv = np.clip(np.digitize(vs, ve) - 1, 0, nv - 1)
+    I_node = Imap[ih, iv]
+    return np.clip(I_tgt / np.maximum(I_node, floor), 0.45, 2.2)
+
+
+def _reach_rectangle_on_surface(
+    z: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    source: np.ndarray,
+    h0: float,
+    h1: float,
+    v0: float,
+    v1: float,
+    gain: float = 0.6,
+    flux: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Surface-space Newton on the four graph edges so each column
+    reaches Vmin/Vmax and each row reaches Hmin/Hmax.
+
+    Angle-space V(H) warps leak into the opposite edge.  A local z
+    bump only changes zx/zy at that border.
+    """
+    z = np.asarray(z, dtype=float).copy()
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    nv, nu = z.shape
+    if nv < 2 or nu < 2:
+        return z
+    hs, vs = _realized_angles_on_block(z, xs, ys, source)
+    sc = _intensity_scale_field(hs, vs, flux, h0, h1, v0, v1)
+    eps = 1e-4
+    g = float(gain)
+
+    z_b = z.copy()
+    z_b[0, :] += eps
+    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
+    dV = (vs_b[0, :] - vs[0, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    z[0, :] += np.clip(g * sc[0, :] * (v0 - vs[0, :]) / dV, -0.08, 0.08)
+
+    z_t = z.copy()
+    z_t[-1, :] += eps
+    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
+    dV = (vs_t[-1, :] - vs[-1, :]) / eps
+    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
+    z[-1, :] += np.clip(g * sc[-1, :] * (v1 - vs[-1, :]) / dV, -0.08, 0.08)
+
+    z_l = z.copy()
+    z_l[:, 0] += eps
+    hs_l, _ = _realized_angles_on_block(z_l, xs, ys, source)
+    dH = (hs_l[:, 0] - hs[:, 0]) / eps
+    dH = np.where(np.abs(dH) < 1e-8, 1e-8, dH)
+    z[:, 0] += np.clip(g * sc[:, 0] * (h0 - hs[:, 0]) / dH, -0.08, 0.08)
+
+    z_r = z.copy()
+    z_r[:, -1] += eps
+    hs_r, _ = _realized_angles_on_block(z_r, xs, ys, source)
+    dH = (hs_r[:, -1] - hs[:, -1]) / eps
+    dH = np.where(np.abs(dH) < 1e-8, 1e-8, dH)
+    z[:, -1] += np.clip(g * sc[:, -1] * (h1 - hs[:, -1]) / dH, -0.08, 0.08)
+    return z
 
 
 def _as_1d_frac(frac: Optional[np.ndarray], n: int, along_u: bool) -> Optional[np.ndarray]:
