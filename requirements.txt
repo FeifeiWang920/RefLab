@@ -4,6 +4,9 @@
 numpy>=1.24.0
 numba>=0.59.0
 
+# Modern ttk theme (light/dark) for the UI
+sv-ttk>=2.6.0
+
 # Precise STEP export (NURBS → OpenCascade)
 cadquery>=2.4.0
 

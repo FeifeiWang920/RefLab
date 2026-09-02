@@ -1,11 +1,7 @@
 """
-Tkinter UI for MF Reflector (v0.10 – tabbed workflow + LucidShape-style dialogs).
+Tkinter UI for MF Reflector (v0.11 – L1 three-tab layout).
 
-- Multi-tab parameter editing
-- F.Start dialog
-- NURBS reflector generation
-- STL / OBJ / STEP export
-- CATIA active Part integration
+Visual/IA upgrade only. Same parameters, same _collect() semantics.
 """
 
 from __future__ import annotations
@@ -24,6 +20,12 @@ try:
     HAS_TK = True
 except ImportError:
     HAS_TK = False
+
+try:
+    import sv_ttk
+    HAS_SV_TTK = True
+except ImportError:
+    HAS_SV_TTK = False
 
 import numpy as np
 from models import (
@@ -44,213 +46,275 @@ from geometry import generate_facets, facets_to_mesh, export_stl, export_obj, ex
 from catia import detect_catia, import_step_to_active_part, CatiaStatus
 
 
+def _system_dpi() -> float:
+    """Logical DPI of the primary display. 96 = 100%."""
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        return float(ctypes.windll.user32.GetDpiForSystem())  # type: ignore[attr-defined]
+    except Exception:
+        return 96.0
+
+
 class MFReflectorApp:
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
-        self.root.title("MF Reflector – NURBS + CATIA (v0.10)")
-        self.root.geometry("720x760")
-        self.root.minsize(680, 680)
+        self.root.title("MF Reflector")
+        self._dpi = _system_dpi()
+        self._scale = max(1.0, self._dpi / 96.0)
+        try:
+            self.root.tk.call("tk", "scaling", self._dpi / 72.0)
+        except tk.TclError:
+            pass
+        w = int(round(760 * self._scale))
+        h = int(round(520 * self._scale))
+        self.root.geometry(f"{w}x{h}")
+        self.root.minsize(int(round(560 * self._scale)), int(round(430 * self._scale)))
         self.reflector: Optional[MFReflector] = None
         self.catia_status: CatiaStatus = detect_catia()
         self._fstart_dialog: Optional["tk.Toplevel"] = None
+        self._hint_labels: list = []
+        self._design_columns: Optional[tuple] = None
+        self._apply_visual_theme()
         self._build_ui()
         self._refresh_catia_status()
+        self._refresh_fstart_summary()
+        self._sync_axis_state()
+        self.root.bind("<Configure>", self._on_root_configure)
+
+    def _px(self, logical: int) -> int:
+        return int(round(logical * self._scale))
+
+    # ------------------------------------------------------------------ theme
+    def _muted_color(self) -> str:
+        """Muted foreground matching the active theme (fallback: fixed grey)."""
+        try:
+            return self.root.tk.call(
+                "ttk::style", "lookup", "TLabel", "-foreground"
+            ) or "#5B616B"
+        except tk.TclError:
+            return "#5B616B"
+
+    def _apply_visual_theme(self) -> None:
+        if HAS_SV_TTK:
+            sv_ttk.set_theme("light")
+        # 全局字体：微软雅黑 12pt（用户指定）。
+        # 注意：sv-ttk 给 ttk 控件定义了专用 SunValley*Font（11pt Segoe UI），
+        # 只改 TkDefaultFont 等命名字体对 ttk 控件无效，必须一并覆盖。
+        import tkinter.font as tkfont
+
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=12)
+        sv_fonts = {
+            "SunValleyBodyFont": 11,        # 正文：所有标签、输入框、下拉框
+            "SunValleyBodyStrongFont": 12,  # 加粗正文：按钮文字
+            "SunValleyBodyLargeFont": 12,   # 大号正文
+            "SunValleyCaptionFont": 10,     # 小字说明（灰色提示、单位 mm/°）
+            "SunValleySubtitleFont": 12,    # 副标题
+            "SunValleyTitleFont": 14,       # 标题
+            "SunValleyTitleLargeFont": 16,  # 大标题
+            "SunValleyDisplayFont": 18,     # 展示级大字
+        }
+        for name, size in sv_fonts.items():
+            try:
+                tkfont.Font(root=self.root, name=name, exists=True).configure(
+                    family="Microsoft YaHei UI", size=size
+                )
+            except tk.TclError:
+                pass  # 主题未加载（无 sv_ttk）时该字体不存在
+        style = ttk.Style(self.root)
+        # 紧凑控件密度：分组框留白尽量小，行距收窄，保持可用
+        style.configure("TLabelframe", padding=self._px(4))
+        style.configure("TLabelframe.Label", padding=(0, 0, 0, self._px(1)))
+        style.configure("TButton", padding=(self._px(10), self._px(3)))
+        style.configure("Accent.TButton", padding=(self._px(14), self._px(3)))
+        self._hint_fg = self._muted_color()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=10)
+        self._build_menubar()
+
+        main = ttk.Frame(self.root, padding=(8, 6, 8, 6))
         main.pack(fill=tk.BOTH, expand=True)
+        main.rowconfigure(2, weight=1)
+        main.columnconfigure(0, weight=1)
 
-        self._build_catia_header(main)
-
-        self.notebook = ttk.Notebook(main)
-        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
-
-        self._build_grid_tab()
-        self._build_gaps_tab()
-        self._build_solver_tab()
-        self._build_patch_fit_tab()
-        self._build_spreads_tab()
-
+        self._build_catia_bar(main)
         self._build_footer(main)
 
-    def _build_catia_header(self, parent: "ttk.Frame") -> None:
-        frame = ttk.LabelFrame(parent, text="CATIA", padding=6)
-        frame.pack(fill=tk.X)
-        self.catia_label = ttk.Label(frame, text="检测中…", wraplength=620)
-        self.catia_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(frame, text="刷新", width=8, command=self._refresh_catia_status).pack(
-            side=tk.RIGHT, padx=4
+        self.notebook = ttk.Notebook(main)
+        self.notebook.grid(row=2, column=0, sticky=tk.NSEW, pady=(6, 6))
+
+        self._build_design_tab()
+        self._build_optics_tab()
+        self._build_construct_tab()
+
+    def _build_menubar(self) -> None:
+        menubar = tk.Menu(self.root)
+        export_menu = tk.Menu(menubar, tearoff=0)
+        export_menu.add_command(label="STL…", command=self.on_export_stl)
+        export_menu.add_command(label="OBJ…", command=self.on_export_obj)
+        export_menu.add_command(label="STEP…", command=self.on_export_step)
+        menubar.add_cascade(label="导出", menu=export_menu)
+        self.root.config(menu=menubar)
+
+    def _build_catia_bar(self, parent: "ttk.Frame") -> None:
+        bar = ttk.Frame(parent)
+        bar.grid(row=0, column=0, sticky=tk.EW)
+        bar.columnconfigure(0, weight=1)
+        self.catia_label = ttk.Label(bar, text="检测中…")
+        self.catia_label.grid(row=0, column=0, sticky=tk.W)
+        ttk.Button(bar, text="刷新", width=8, command=self._refresh_catia_status).grid(
+            row=0, column=1, sticky=tk.E, padx=(8, 0)
         )
 
-    def _build_grid_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Grid & Source")
+    def _build_design_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab, text="设计")
+        self._design_tab = tab
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
 
-        source = ttk.LabelFrame(tab, text="Source (Point / Lambertian)", padding=8)
-        source.pack(fill=tk.X, pady=(0, 8))
-        self.src_x = self._add_entry(source, "X position [mm]", "0.0", 0)
-        self.src_y = self._add_entry(source, "Y position [mm]", "0.0", 1)
-        self.src_z = self._add_entry(source, "Z position [mm]", "0.0", 2)
-        self.focal = self._add_entry(source, "Carrier focal [mm]", "10.0", 3)
+        source = ttk.LabelFrame(tab, text="Source", padding=6)
+        source.grid(row=0, column=0, sticky="new", padx=(0, 8), pady=(0, 8))
+        self.src_x = self._add_entry(source, "X position", "0.0", 0, unit="mm")
+        self.src_y = self._add_entry(source, "Y position", "0.0", 1, unit="mm")
+        self.src_z = self._add_entry(source, "Z position", "0.0", 2, unit="mm")
         self.src_pattern = self._add_combobox(
-            source,
-            "Angular pattern",
-            ["lambertian", "isotropic"],
-            "lambertian",
-            4,
+            source, "Angular pattern", ["lambertian", "isotropic"], "lambertian", 3
         )
-        self.src_lambert_n = self._add_entry(source, "Lambertian order n", "1.0", 5)
-        self.src_axis_auto = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            source,
-            text="Auto axis (source → reflector centre)",
-            variable=self.src_axis_auto,
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
-        self.src_axis_x = self._add_entry(source, "Axis X", "0.0", 7)
-        self.src_axis_y = self._add_entry(source, "Axis Y", "0.0", 8)
-        self.src_axis_z = self._add_entry(source, "Axis Z", "-1.0", 9)
+        self.focal = self._add_entry(source, "Carrier focal", "10.0", 4, unit="mm")
 
-        # LucidShape-style size row: degree | #facets | offset | startZ
-        size = ttk.LabelFrame(tab, text="Size (LucidShape)", padding=8)
-        size.pack(fill=tk.X, pady=(0, 8))
+        size = ttk.LabelFrame(tab, text="Size", padding=6)
+        size.grid(row=0, column=1, sticky="new", padx=(0, 0), pady=(0, 8))
 
-        # Row 0 labels
-        ttk.Label(size, text="degree U,V").grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        ttk.Label(size, text="# facets U,V").grid(row=0, column=2, columnspan=2, sticky=tk.W, padx=(12, 0))
-        ttk.Label(size, text="offset X,Y").grid(row=0, column=4, columnspan=2, sticky=tk.W, padx=(12, 0))
-        ttk.Label(size, text="start Z").grid(row=0, column=6, sticky=tk.W, padx=(12, 0))
-
-        self.degree_u = tk.StringVar(value="5")
-        self.degree_v = tk.StringVar(value="5")
         self.n_u = tk.StringVar(value="4")
         self.n_v = tk.StringVar(value="4")
+        self.degree_u = tk.StringVar(value="5")
+        self.degree_v = tk.StringVar(value="5")
         self.offset_x = tk.StringVar(value="-20")
         self.offset_y = tk.StringVar(value="-20")
         self.start_z = tk.StringVar(value="0")
-
-        ttk.Entry(size, textvariable=self.degree_u, width=6).grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(size, textvariable=self.degree_v, width=6).grid(row=1, column=1, sticky=tk.W, pady=2, padx=(2, 0))
-        ttk.Entry(size, textvariable=self.n_u, width=6).grid(row=1, column=2, sticky=tk.W, pady=2, padx=(12, 0))
-        ttk.Entry(size, textvariable=self.n_v, width=6).grid(row=1, column=3, sticky=tk.W, pady=2, padx=(2, 0))
-        ttk.Entry(size, textvariable=self.offset_x, width=8).grid(row=1, column=4, sticky=tk.W, pady=2, padx=(12, 0))
-        ttk.Entry(size, textvariable=self.offset_y, width=8).grid(row=1, column=5, sticky=tk.W, pady=2, padx=(2, 0))
-        ttk.Entry(size, textvariable=self.start_z, width=8).grid(row=1, column=6, sticky=tk.W, pady=2, padx=(12, 0))
-
-        # width / height deltas (comma-separated, one value per facet)
-        deltas = ttk.LabelFrame(tab, text="Facet size deltas [mm]", padding=8)
-        deltas.pack(fill=tk.X)
-        ttk.Label(deltas, text="width deltas").grid(row=0, column=0, sticky=tk.W)
         self.width_deltas = tk.StringVar(value="10,10,10,10")
-        ttk.Entry(deltas, textvariable=self.width_deltas, width=48).grid(
-            row=0, column=1, sticky=tk.EW, padx=6, pady=2
-        )
-        ttk.Label(deltas, text="height deltas").grid(row=1, column=0, sticky=tk.W)
         self.height_deltas = tk.StringVar(value="10,10,10,10")
-        ttk.Entry(deltas, textvariable=self.height_deltas, width=48).grid(
-            row=1, column=1, sticky=tk.EW, padx=6, pady=2
+
+        self._add_pair(size, "# facets U, V", self.n_u, self.n_v, 0)
+        self._add_pair(size, "degree U, V", self.degree_u, self.degree_v, 1)
+        self._add_pair(size, "offset X, Y", self.offset_x, self.offset_y, 2, unit="mm")
+        self._add_labeled_entry(size, "start Z", self.start_z, 3, unit="mm")
+        self._add_labeled_entry(size, "width deltas", self.width_deltas, 4, wide=True)
+        self._add_labeled_entry(size, "height deltas", self.height_deltas, 5, wide=True)
+        self._hint(
+            size,
+            "逗号分隔，个数对应面片数 U / V，不足则重复末值。",
+            6,
         )
-        deltas.columnconfigure(1, weight=1)
 
-        ttk.Label(
-            tab,
-            text="width/height deltas: comma-separated sizes for each facet column/row "
-                 "(length should match # facets U / V). "
-                 "offset X,Y is the lower-left corner of the aperture; start Z is the "
-                 "reference height for the first facet seed.",
-            wraplength=660,
-        ).pack(fill=tk.X, pady=(10, 0))
+        adv_wrap = ttk.LabelFrame(tab, text="Advanced", padding=6)
+        adv_wrap.grid(row=1, column=0, columnspan=2, sticky="new")
+        self.src_axis_auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            adv_wrap,
+            text="Auto axis（光源 → 反射面中心）",
+            variable=self.src_axis_auto,
+            command=self._sync_axis_state,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W)
+        self.src_axis_x = tk.StringVar(value="0.0")
+        self.src_axis_y = tk.StringVar(value="0.0")
+        self.src_axis_z = tk.StringVar(value="-1.0")
+        self.src_lambert_n = tk.StringVar(value="1.0")
+        axis_row = ttk.Frame(adv_wrap)
+        axis_row.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+        ttk.Label(axis_row, text="Axis X,Y,Z").pack(side=tk.LEFT)
+        self._ax_widgets = []
+        for var in (self.src_axis_x, self.src_axis_y, self.src_axis_z):
+            e = ttk.Entry(axis_row, textvariable=var, width=8, justify=tk.RIGHT)
+            e.pack(side=tk.LEFT, padx=(6, 0))
+            self._ax_widgets.append(e)
+        n_row = ttk.Frame(adv_wrap)
+        n_row.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+        ttk.Label(n_row, text="Lambertian n").pack(side=tk.LEFT)
+        ttk.Entry(n_row, textvariable=self.src_lambert_n, width=8, justify=tk.RIGHT).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
 
-    def _build_gaps_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Gaps")
+        self._design_columns = (source, size)
+        self._design_advanced = adv_wrap
+        tab.bind("<Configure>", self._on_design_configure)
 
-        frame = ttk.LabelFrame(tab, text="Gap Parameter (LucidShape)", padding=8)
+    def _build_optics_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab, text="光学")
+
+        frame = ttk.LabelFrame(tab, text="Spreads", padding=6)
         frame.pack(fill=tk.X)
+        self.spread_h = self._add_entry(frame, "H angles", "-20,20", 0, unit="°", width=16)
+        self.spread_v = self._add_entry(frame, "V angles", "-10,10", 1, unit="°", width=16)
+        self.edge_ray = self._add_combobox(
+            frame,
+            "Edge-ray",
+            [e.value for e in EdgeRayMode],
+            EdgeRayMode.CENTER.value,
+            2,
+        )
+        self.uniform_intensity = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Uniform intensity",
+            variable=self.uniform_intensity,
+        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+        self._hint(
+            frame,
+            "按入射通量做可分离映射，四边钉在设定的 H/V 端点。格式：min,max。",
+            4,
+            cols=3,
+        )
 
-        # Mode: gap | no gap
-        ttk.Label(frame, text="Mode").grid(row=0, column=0, sticky=tk.W, pady=2)
+    def _build_construct_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab, text="构造")
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+
+        gaps = ttk.LabelFrame(tab, text="Gaps", padding=6)
+        gaps.grid(row=0, column=0, sticky="new", padx=(0, 8), pady=(0, 8))
+        ttk.Label(gaps, text="Mode").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.gap_type = tk.StringVar(value=GapType.GAP.value)
         mode_box = ttk.Combobox(
-            frame,
+            gaps,
             textvariable=self.gap_type,
             values=[GapType.GAP.value, GapType.NO_GAP.value],
             state="readonly",
             width=16,
         )
-        mode_box.grid(row=0, column=1, sticky=tk.W, padx=4, pady=2)
+        mode_box.grid(row=0, column=1, sticky=tk.W, padx=3, pady=2)
         mode_box.bind("<<ComboboxSelected>>", lambda e: self._sync_gap_mode_options())
 
-        # Sub-mode depends on gap vs no gap
-        ttk.Label(frame, text="Option").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(gaps, text="Option").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.gap_mode = tk.StringVar(value=GapSurfaceMode.SURFACE.value)
         self.gap_option_box = ttk.Combobox(
-            frame,
+            gaps,
             textvariable=self.gap_mode,
-            values=[
-                GapSurfaceMode.EMPTY.value,
-                GapSurfaceMode.SURFACE.value,
-            ],
+            values=[GapSurfaceMode.EMPTY.value, GapSurfaceMode.SURFACE.value],
             state="readonly",
             width=16,
         )
-        self.gap_option_box.grid(row=1, column=1, sticky=tk.W, padx=4, pady=2)
+        self.gap_option_box.grid(row=1, column=1, sticky=tk.W, padx=3, pady=2)
+        self.gap_u = self._add_entry(gaps, "Size U", "0.2", 2, unit="mm")
+        self.gap_v = self._add_entry(gaps, "Size V", "0.2", 3, unit="mm")
 
-        self.gap_u = self._add_entry(frame, "Size U / gap [mm]", "0.2", 2)
-        self.gap_v = self._add_entry(frame, "Size V / gap [mm]", "0.2", 3)
+        start = ttk.LabelFrame(tab, text="F.Start", padding=6)
+        start.grid(row=0, column=1, sticky="new", padx=(0, 0), pady=(0, 8))
+        self.fstart_summary = ttk.Label(start, text="")
+        self.fstart_summary.pack(anchor=tk.W, pady=(0, 8))
+        ttk.Button(start, text="F.Start…", command=self._open_fstart_dialog).pack(anchor=tk.W)
 
-        ttk.Label(
-            tab,
-            text=(
-                "Mode = gap: Option = empty | surface. "
-                "Deltas include gap — middle facet optical size = delta − gap, "
-                "edge facet = delta − gap/2.\n"
-                "Mode = no gap: Option = new border | old border | average "
-                "(shared edge is forced to match; no physical gap)."
-            ),
-            wraplength=660,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(10, 0))
-
-        self._sync_gap_mode_options()
-
-    def _sync_gap_mode_options(self) -> None:
-        """Swap Option list according to gap / no gap (LucidShape)."""
-        if self.gap_type.get() == GapType.NO_GAP.value:
-            opts = [
-                GapSurfaceMode.NEW_BORDER.value,
-                GapSurfaceMode.OLD_BORDER.value,
-                GapSurfaceMode.AVERAGE.value,
-            ]
-            default = GapSurfaceMode.NEW_BORDER.value
-        else:
-            opts = [
-                GapSurfaceMode.EMPTY.value,
-                GapSurfaceMode.SURFACE.value,
-            ]
-            default = GapSurfaceMode.SURFACE.value
-        self.gap_option_box["values"] = opts
-        if self.gap_mode.get() not in opts:
-            self.gap_mode.set(default)
-
-    def _build_solver_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Solver")
-
-        frame = ttk.LabelFrame(tab, text="Numerical Solver", padding=8)
-        frame.pack(fill=tk.X)
-        self.samples = self._add_entry(frame, "Samples per facet edge", "15", 0)
-        self.solve = self._add_combobox(
-            frame,
-            "Solve order",
-            [s.value for s in SolveMethod],
-            SolveMethod.V_FIRST.value,
-            1,
-        )
-        self.solver_iterations = self._add_entry(frame, "Max iterations", "5", 2)
-        self.solver_tolerance = self._add_entry(frame, "Convergence tolerance", "1e-5", 3)
-
-        # F.Start variables are shared by the dialog.
         self.use_start_point = tk.BooleanVar(value=True)
         self.start_x = tk.StringVar(value="0.0")
         self.start_y = tk.StringVar(value="0.0")
@@ -263,125 +327,83 @@ class MFReflectorApp:
         self.z_step_u = tk.StringVar(value="0.0")
         self.z_step_v = tk.StringVar(value="0.0")
 
-        ttk.Button(
-            tab,
-            text="F.Start…",
-            command=self._open_fstart_dialog,
-        ).pack(anchor=tk.W, pady=(12, 0))
-        ttk.Label(
-            tab,
-            text="F.Start controls the calculation start point, neighbor boundary "
-                 "inheritance, reference position, and per-facet U/V Z steps.",
-            wraplength=620,
-        ).pack(fill=tk.X, pady=(8, 0))
-
-    def _build_patch_fit_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Patch Fit")
-
-        frame = ttk.LabelFrame(tab, text="Solve Patch Parameters", padding=8)
-        frame.pack(fill=tk.X)
+        patch = ttk.LabelFrame(tab, text="Patch Fit", padding=6)
+        patch.grid(row=1, column=0, columnspan=2, sticky="new", pady=(0, 8))
         self.patch_method = self._add_combobox(
-            frame,
+            patch,
             "Patch fit method",
             [m.value for m in PatchFitMethod],
             PatchFitMethod.APPROXIMATE.value,
             0,
         )
-        self.fit_patches_u = self._add_entry(frame, "# Fit patches U", "1", 1)
-        self.fit_patches_v = self._add_entry(frame, "# Fit patches V", "1", 2)
+
+        self._adv_visible = tk.BooleanVar(value=False)
+        adv_head = ttk.Frame(tab)
+        adv_head.grid(row=2, column=0, columnspan=2, sticky=tk.EW)
+        self._adv_toggle = ttk.Checkbutton(
+            adv_head,
+            text="Advanced",
+            variable=self._adv_visible,
+            command=self._toggle_advanced,
+        )
+        self._adv_toggle.pack(anchor=tk.W)
+
+        self._adv_body = ttk.LabelFrame(tab, text="Solver", padding=6)
+        self.samples = self._add_entry(self._adv_body, "Samples per edge", "15", 0)
+        self.solve = self._add_combobox(
+            self._adv_body,
+            "Solve order",
+            [s.value for s in SolveMethod],
+            SolveMethod.V_FIRST.value,
+            1,
+        )
+        self.solver_iterations = self._add_entry(self._adv_body, "Max iterations", "5", 2)
+        self.solver_tolerance = self._add_entry(self._adv_body, "Tolerance", "1e-5", 3)
+        self.fit_patches_u = self._add_entry(self._adv_body, "# Fit patches U", "1", 4)
+        self.fit_patches_v = self._add_entry(self._adv_body, "# Fit patches V", "1", 5)
         self.continuity_u = self._add_combobox(
-            frame,
+            self._adv_body,
             "Continuity U",
             [c.value for c in PatchContinuity],
             PatchContinuity.POINT.value,
-            3,
+            6,
         )
         self.continuity_v = self._add_combobox(
-            frame,
+            self._adv_body,
             "Continuity V",
             [c.value for c in PatchContinuity],
             PatchContinuity.POINT.value,
-            4,
+            7,
         )
 
-        ttk.Label(
-            tab,
-            text="Approximation + keep size keeps the fitted optical surface inside the "
-                 "base grid rectangle. Tangent continuity uses a common parameterization.",
-            wraplength=620,
-        ).pack(fill=tk.X, pady=(10, 0))
+        self._sync_gap_mode_options()
 
-    def _build_spreads_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Spreads")
-
-        frame = ttk.LabelFrame(tab, text="Far-field Spreads", padding=8)
-        frame.pack(fill=tk.X)
-        self.spread_h = self._add_entry(
-            frame,
-            "H angles [°] per facet (e.g. -20,20)",
-            "-20,20",
-            0,
-        )
-        self.spread_v = self._add_entry(
-            frame,
-            "V angles [°] per facet (e.g. -5,5)",
-            "-10,10",
-            1,
-        )
-        self.edge_ray = self._add_combobox(
-            frame,
-            "Edge-ray mode",
-            [e.value for e in EdgeRayMode],
-            EdgeRayMode.CENTER.value,
-            2,
-        )
-        self.uniform_intensity = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frame,
-            text="均匀光强 / Uniform intensity (energy mapping)",
-            variable=self.uniform_intensity,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 2))
-        ttk.Label(
-            tab,
-            text=(
-                "关闭：保持现有算法，面片参数 (u,v) 均匀映射到 H/V 角度列表。\n"
-                "开启：按朗伯入射通量做可分离映射 H(u)、V(v)，"
-                "四条边钉在设定的 H/V 矩形端点上，内部按通量加权逆校正均匀性。"
-                "θs 为相对光源光轴的出射角，θi 为入射角，r 为距离。"
-            ),
-            wraplength=660,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(10, 0))
+    def _toggle_advanced(self) -> None:
+        if self._adv_visible.get():
+            self._adv_body.grid(row=3, column=0, columnspan=2, sticky="new", pady=(2, 0))
+        else:
+            self._adv_body.grid_remove()
 
     def _build_footer(self, parent: "ttk.Frame") -> None:
         footer = ttk.Frame(parent)
-        footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        footer.grid(row=3, column=0, sticky=tk.EW)
+        ttk.Separator(footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
+        btns = ttk.Frame(footer)
+        btns.pack(fill=tk.X)
+        self.status = ttk.Label(footer, text="就绪。", anchor=tk.W)
+        self.status.pack(fill=tk.X, pady=(0, 8))
+        self.btn_generate = ttk.Button(
+            btns, text="生成", style="Accent.TButton", command=self.on_apply
+        )
+        self.btn_generate.pack(side=tk.RIGHT)
+        self.btn_catia = ttk.Button(btns, text="发送到 CATIA", command=self.on_send_catia)
+        self.btn_catia.pack(side=tk.RIGHT, padx=(0, 8))
 
-        row1 = ttk.Frame(footer)
-        row1.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(row1, text="Apply / Generate", command=self.on_apply).pack(
-            side=tk.LEFT, padx=3
-        )
-        ttk.Button(row1, text="Export STL…", command=self.on_export_stl).pack(
-            side=tk.LEFT, padx=3
-        )
-        ttk.Button(row1, text="Export OBJ…", command=self.on_export_obj).pack(
-            side=tk.LEFT, padx=3
-        )
-        ttk.Button(row1, text="Export STEP…", command=self.on_export_step).pack(
-            side=tk.LEFT, padx=3
-        )
-
-        row2 = ttk.Frame(footer)
-        row2.pack(fill=tk.X)
-        self.btn_catia = ttk.Button(
-            row2, text="Send to CATIA Part", command=self.on_send_catia
-        )
-        self.btn_catia.pack(side=tk.LEFT, padx=3)
-        self.status = ttk.Label(footer, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
-        self.status.pack(fill=tk.X, pady=(8, 0))
+    # ------------------------------------------------------------------ helpers
+    def _hint(self, parent, text: str, row: int, cols: int = 3) -> None:
+        lbl = ttk.Label(parent, text=text, foreground=self._hint_fg)
+        lbl.grid(row=row, column=0, columnspan=cols, sticky=tk.W, pady=(2, 0))
+        self._hint_labels.append(lbl)
 
     def _add_entry(
         self,
@@ -389,21 +411,66 @@ class MFReflectorApp:
         label: str,
         default,
         row: int,
-        width: int = 18,
+        width: int = 14,
+        unit: str = "",
     ) -> "tk.StringVar":
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
-        # Reuse an existing StringVar when the caller passes one (F.Start
-        # dialog).  A fresh var from `.get()` would display the value but
-        # never write back into `_collect()`.
         if isinstance(default, tk.StringVar):
             var = default
         else:
             var = tk.StringVar(value=str(default))
-        ttk.Entry(parent, textvariable=var, width=width).grid(
-            row=row, column=1, sticky=tk.W, padx=4, pady=2
+        ttk.Entry(parent, textvariable=var, width=width, justify=tk.RIGHT).grid(
+            row=row, column=1, sticky=tk.W, padx=3, pady=2
         )
-        parent.columnconfigure(0, weight=1)
+        if unit:
+            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
+                row=row, column=2, sticky=tk.W
+            )
         return var
+
+    def _add_labeled_entry(
+        self,
+        parent,
+        label: str,
+        var: "tk.StringVar",
+        row: int,
+        unit: str = "",
+        wide: bool = False,
+    ) -> "ttk.Entry":
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        entry = ttk.Entry(
+            parent,
+            textvariable=var,
+            width=22 if wide else 9,
+            justify=tk.RIGHT if not wide else tk.LEFT,
+        )
+        entry.grid(row=row, column=1, columnspan=2 if wide else 1, sticky=tk.W, padx=3, pady=2)
+        if unit and not wide:
+            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
+                row=row, column=2, sticky=tk.W
+            )
+        return entry
+
+    def _add_pair(
+        self,
+        parent,
+        label: str,
+        var_a: "tk.StringVar",
+        var_b: "tk.StringVar",
+        row: int,
+        unit: str = "",
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        pair = ttk.Frame(parent)
+        pair.grid(row=row, column=1, sticky=tk.W, padx=3, pady=2)
+        ttk.Entry(pair, textvariable=var_a, width=7, justify=tk.RIGHT).pack(side=tk.LEFT)
+        ttk.Entry(pair, textvariable=var_b, width=8, justify=tk.RIGHT).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        if unit:
+            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
+                row=row, column=2, sticky=tk.W
+            )
 
     def _add_combobox(
         self,
@@ -415,14 +482,76 @@ class MFReflectorApp:
     ) -> "tk.StringVar":
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
         var = tk.StringVar(value=default)
-        ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=24).grid(
-            row=row, column=1, sticky=tk.W, padx=4, pady=2
-        )
-        parent.columnconfigure(0, weight=1)
+        ttk.Combobox(
+            parent, textvariable=var, values=values, state="readonly", width=16
+        ).grid(row=row, column=1, sticky=tk.W, padx=3, pady=2)
         return var
 
+    def _sync_axis_state(self) -> None:
+        state = tk.DISABLED if self.src_axis_auto.get() else tk.NORMAL
+        for w in getattr(self, "_ax_widgets", []):
+            try:
+                w.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _on_design_configure(self, event=None) -> None:
+        if not self._design_columns:
+            return
+        tab = self._design_tab
+        left, right = self._design_columns
+        width = tab.winfo_width()
+        threshold = self._px(740)
+        adv = getattr(self, "_design_advanced", None)
+        if width < threshold and width > 2:
+            left.grid(row=0, column=0, columnspan=2, sticky="new", padx=0, pady=(0, 8))
+            right.grid(row=1, column=0, columnspan=2, sticky="new", padx=0, pady=(0, 8))
+            if adv is not None:
+                adv.grid(row=2, column=0, columnspan=2, sticky="new")
+        else:
+            left.grid(row=0, column=0, columnspan=1, sticky="new", padx=(0, 8), pady=(0, 8))
+            right.grid(row=0, column=1, columnspan=1, sticky="new", padx=0, pady=(0, 8))
+            if adv is not None:
+                adv.grid(row=1, column=0, columnspan=2, sticky="new")
+
+    def _on_root_configure(self, event=None) -> None:
+        if event and event.widget is not self.root:
+            return
+        wrap = max(240, self.root.winfo_width() - self._px(80))
+        for lbl in self._hint_labels:
+            try:
+                lbl.configure(wraplength=wrap)
+            except tk.TclError:
+                pass
+        try:
+            self.catia_label.configure(wraplength=max(200, wrap - self._px(120)))
+        except tk.TclError:
+            pass
+
+    def _sync_gap_mode_options(self) -> None:
+        if self.gap_type.get() == GapType.NO_GAP.value:
+            opts = [
+                GapSurfaceMode.NEW_BORDER.value,
+                GapSurfaceMode.OLD_BORDER.value,
+                GapSurfaceMode.AVERAGE.value,
+            ]
+            default = GapSurfaceMode.NEW_BORDER.value
+        else:
+            opts = [GapSurfaceMode.EMPTY.value, GapSurfaceMode.SURFACE.value]
+            default = GapSurfaceMode.SURFACE.value
+        self.gap_option_box["values"] = opts
+        if self.gap_mode.get() not in opts:
+            self.gap_mode.set(default)
+
+    def _refresh_fstart_summary(self) -> None:
+        if self.use_start_point.get():
+            loc = f"全局起点 ({self.start_x.get()}, {self.start_y.get()})"
+        else:
+            loc = "全局起点关闭"
+        auto = "自动参考点" if self.start_auto.get() else "手动 U/V"
+        self.fstart_summary.config(text=f"{loc} · {auto}")
+
     def _aperture_bounds(self) -> tuple[float, float, float, float]:
-        """Current Grid & Source aperture rectangle (x0, x1, y0, y1)."""
         n_u = max(1, int(float(self.n_u.get())))
         n_v = max(1, int(float(self.n_v.get())))
         widths = self._parse_deltas(self.width_deltas.get(), n_u)
@@ -437,18 +566,12 @@ class MFReflectorApp:
         on_apply,
         status_var: "tk.StringVar",
     ) -> None:
-        """
-        Footer pinned to the bottom of the Toplevel so Apply/OK/Close
-        stay visible even when the form above is tall.
-        """
         footer = ttk.Frame(dialog, padding=(12, 8, 12, 12))
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-
         ttk.Separator(footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
         ttk.Label(footer, textvariable=status_var, foreground="#1a5f2a").pack(
             anchor=tk.W, pady=(0, 8)
         )
-
         buttons = ttk.Frame(footer)
         buttons.pack(fill=tk.X)
 
@@ -456,9 +579,7 @@ class MFReflectorApp:
             if on_apply():
                 dialog.destroy()
 
-        ttk.Button(buttons, text="Apply", command=on_apply, width=10).pack(
-            side=tk.LEFT
-        )
+        ttk.Button(buttons, text="Apply", command=on_apply, width=10).pack(side=tk.LEFT)
         ttk.Button(buttons, text="OK", command=apply_and_close, width=10).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -477,12 +598,11 @@ class MFReflectorApp:
         self._fstart_dialog = dialog
         dialog.title("F.Start")
         dialog.transient(self.root)
-        dialog.minsize(460, 420)
-        dialog.geometry("520x620")
+        dialog.minsize(self._px(460), self._px(420))
+        dialog.geometry(f"{self._px(520)}x{self._px(620)}")
         dialog.resizable(True, True)
         dialog.grab_set()
 
-        # Draft copies: typing does nothing until Apply / OK.
         d_use_start = tk.BooleanVar(value=self.use_start_point.get())
         d_start_x = tk.StringVar(value=self.start_x.get())
         d_start_y = tk.StringVar(value=self.start_y.get())
@@ -539,72 +659,61 @@ class MFReflectorApp:
             self.use_neighbor_curve.set(d_neighbor.get())
             self.z_step_u.set(f"{zu:g}")
             self.z_step_v.set(f"{zv:g}")
+            self._refresh_fstart_summary()
             if d_use_start.get():
                 status.set(f"Applied — start ({sx:g}, {sy:g}). Generate to rebuild.")
             else:
                 status.set("Applied — global start off, using U/V. Generate to rebuild.")
             return True
 
-        # Footer first so Apply stays on screen when the form is tall.
         self._dialog_action_bar(dialog, apply_fstart, status)
 
         body = ttk.Frame(dialog, padding=(12, 12, 12, 0))
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
-        frame = body
 
-        grid_group = ttk.LabelFrame(frame, text="Grid Start Point", padding=8)
-        grid_group.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+        grid_group = ttk.LabelFrame(body, text="Grid Start Point", padding=8)
+        grid_group.grid(row=0, column=0, sticky=tk.EW)
         ttk.Checkbutton(
-            grid_group,
-            text="Use global start point",
-            variable=d_use_start,
+            grid_group, text="使用全局起点", variable=d_use_start
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(grid_group, "Start X [mm]", d_start_x, 1, 18)
-        self._add_entry(grid_group, "Start Y [mm]", d_start_y, 2, 18)
+        self._add_entry(grid_group, "Start X", d_start_x, 1, unit="mm")
+        self._add_entry(grid_group, "Start Y", d_start_y, 2, unit="mm")
         try:
             x0, x1, y0, y1 = self._aperture_bounds()
             bounds = (
-                f"Must lie inside the current aperture: "
-                f"X {x0:.1f}…{x1:.1f}, Y {y0:.1f}…{y1:.1f}. "
-                f"Centre is ({0.5 * (x0 + x1):.1f}, {0.5 * (y0 + y1):.1f})."
+                f"须落在当前孔径内：X {x0:.1f}…{x1:.1f}，Y {y0:.1f}…{y1:.1f}。"
+                f"中心 ({0.5 * (x0 + x1):.1f}, {0.5 * (y0 + y1):.1f})。"
             )
         except Exception:
-            bounds = "Must lie inside the aperture on the Grid & Source tab."
-        ttk.Label(grid_group, text=bounds, wraplength=450, justify=tk.LEFT).grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+            bounds = "须落在设计页的孔径范围内。"
+        ttk.Label(grid_group, text=bounds, wraplength=self._px(450), justify=tk.LEFT).grid(
+            row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0)
         )
 
-        calc_group = ttk.LabelFrame(frame, text="Facet Calculation Start", padding=8)
-        calc_group.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        calc_group = ttk.LabelFrame(body, text="Facet Calculation Start", padding=8)
+        calc_group.grid(row=1, column=0, sticky=tk.EW, pady=(10, 0))
         ttk.Checkbutton(
-            calc_group,
-            text="Automatic (use reference position)",
-            variable=d_start_auto,
+            calc_group, text="自动（使用参考点）", variable=d_start_auto
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(calc_group, "Start U [0..1]", d_calc_u, 1, 18)
-        self._add_entry(calc_group, "Start V [0..1]", d_calc_v, 2, 18)
-        self._add_entry(calc_group, "Reference U [0..1]", d_ref_u, 3, 18)
-        self._add_entry(calc_group, "Reference V [0..1]", d_ref_v, 4, 18)
+        self._add_entry(calc_group, "Start U", d_calc_u, 1)
+        self._add_entry(calc_group, "Start V", d_calc_v, 2)
+        self._add_entry(calc_group, "Reference U", d_ref_u, 3)
+        self._add_entry(calc_group, "Reference V", d_ref_v, 4)
 
-        neighbor_group = ttk.LabelFrame(frame, text="Boundary & Z Steps", padding=8)
-        neighbor_group.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+        neighbor_group = ttk.LabelFrame(body, text="Boundary & Z Steps", padding=8)
+        neighbor_group.grid(row=2, column=0, sticky=tk.EW, pady=(10, 0))
         ttk.Checkbutton(
-            neighbor_group,
-            text="Use base curve from neighbor",
-            variable=d_neighbor,
+            neighbor_group, text="使用邻边基线", variable=d_neighbor
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(neighbor_group, "Z step U [mm]", d_z_u, 1, 18)
-        self._add_entry(neighbor_group, "Z step V [mm]", d_z_v, 2, 18)
+        self._add_entry(neighbor_group, "Z step U", d_z_u, 1, unit="mm")
+        self._add_entry(neighbor_group, "Z step V", d_z_v, 2, unit="mm")
         ttk.Label(
             neighbor_group,
-            text="Off: facets keep their exact optical spread and connect only at "
-                 "the reference point (recommended — spot range = settings).\n"
-                 "On: the shared edge curve is forced identical (watertight), but "
-                 "the facet optics bend near that border.",
-            wraplength=450,
+            text="关：只在参考点对齐，光学展开保持设定范围。开：共享边水密，接缝附近光学会弯。",
+            wraplength=self._px(450),
             justify=tk.LEFT,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
 
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
@@ -621,7 +730,6 @@ class MFReflectorApp:
     # ------------------------------------------------------------------ Data
     @staticmethod
     def _parse_deltas(text: str, n: int, fallback: float = 10.0) -> list:
-        """Parse '10,10,10,10' → list of length n (pad/truncate as needed)."""
         parts = [p.strip() for p in str(text).replace(";", ",").split(",") if p.strip()]
         vals = [float(p) for p in parts] if parts else []
         if not vals:
@@ -642,14 +750,10 @@ class MFReflectorApp:
         start_z = float(self.start_z.get())
 
         calculation_start_u = (
-            None
-            if self.start_auto.get()
-            else float(self.calc_start_u.get())
+            None if self.start_auto.get() else float(self.calc_start_u.get())
         )
         calculation_start_v = (
-            None
-            if self.start_auto.get()
-            else float(self.calc_start_v.get())
+            None if self.start_auto.get() else float(self.calc_start_v.get())
         )
         gap_type = GapType(self.gap_type.get())
         step_z = 0.0
@@ -718,19 +822,16 @@ class MFReflectorApp:
             fit_patch_continuity_v=PatchContinuity(self.continuity_v.get()),
         )
 
-    # ------------------------------------------------------------------ Actions
     def on_apply(self) -> None:
         try:
             self.reflector = self._collect()
             generate_facets(self.reflector)
             n_opt = sum(1 for f in self.reflector.facets if not f.is_gap_surface)
             n_gap = sum(1 for f in self.reflector.facets if f.is_gap_surface)
-            self.status.config(
-                text=f"Generated {n_opt} NURBS facets + {n_gap} gap surfaces."
-            )
+            self.status.config(text=f"已生成 {n_opt} 个 NURBS 光学面 + {n_gap} 个缝面。")
         except Exception as exc:
-            messagebox.showerror("Error", str(exc))
-            self.status.config(text="Generation failed.")
+            messagebox.showerror("生成失败", str(exc))
+            self.status.config(text="生成失败。")
 
     def on_export_stl(self) -> None:
         if not self._ensure_generated():
@@ -741,7 +842,7 @@ class MFReflectorApp:
         if path:
             vertices, faces = facets_to_mesh(self.reflector.facets)
             export_stl(vertices, faces, path)
-            self.status.config(text=f"Saved {path}")
+            self.status.config(text=f"已保存 {path}")
 
     def on_export_obj(self) -> None:
         if not self._ensure_generated():
@@ -752,7 +853,7 @@ class MFReflectorApp:
         if path:
             vertices, faces = facets_to_mesh(self.reflector.facets)
             export_obj(vertices, faces, path)
-            self.status.config(text=f"Saved {path}")
+            self.status.config(text=f"已保存 {path}")
 
     def on_export_step(self) -> None:
         if not self._ensure_generated():
@@ -763,12 +864,11 @@ class MFReflectorApp:
         if path:
             try:
                 n = export_step(self.reflector.facets, path, include_gap_surfaces=True)
-                self.status.config(text=f"STEP saved ({n} faces): {path}")
+                self.status.config(text=f"STEP 已保存（{n} 面）：{path}")
             except Exception as exc:
-                messagebox.showerror("STEP export failed", str(exc))
+                messagebox.showerror("STEP 导出失败", str(exc))
 
     def on_send_catia(self) -> None:
-        # One-click import: generate first if needed, then send directly.
         if not self.reflector or not self.reflector.is_generated():
             self.on_apply()
             if not self.reflector or not self.reflector.is_generated():
@@ -778,8 +878,6 @@ class MFReflectorApp:
             messagebox.showwarning("CATIA", self.catia_status.message)
             return
         try:
-            # Both the source STEP and the temporary CATPart used by the CATIA
-            # bridge are removed after the import completes.
             with tempfile.TemporaryDirectory(prefix="mf_reflector_") as temp_dir:
                 tmp = Path(temp_dir) / "reflector.stp"
                 export_step(self.reflector.facets, str(tmp), include_gap_surfaces=True)
@@ -794,7 +892,7 @@ class MFReflectorApp:
 
     def _ensure_generated(self) -> bool:
         if not self.reflector or not self.reflector.is_generated():
-            messagebox.showwarning("Warning", "请先点击 Apply / Generate 生成反射面。")
+            messagebox.showwarning("提示", "请先生成反射面。")
             return False
         return True
 
@@ -812,4 +910,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
