@@ -99,6 +99,29 @@ def test_visual_theme_and_primary_button():
     root.destroy()
 
 
+def test_main_sets_blas_threads_before_numpy():
+    """`python main.py` 启动路径必须设置 BLAS 单线程（README 性能声明的回归测试）。"""
+    import os
+    import subprocess
+
+    # 剥离父进程的设置（CI 在 job 级设了这两个变量），否则测不出 main.py 自己设没设
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+    }
+    code = (
+        "import os, main; "
+        "print(os.environ.get('OPENBLAS_NUM_THREADS'), "
+        "os.environ.get('MKL_NUM_THREADS'))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=120, cwd=str(ROOT), env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1 1"
+
+
 def test_parse_deltas_and_aperture_bounds():
     """UI 纯函数：尺寸列表解析与孔径范围。"""
     from ui.app_state import parse_deltas

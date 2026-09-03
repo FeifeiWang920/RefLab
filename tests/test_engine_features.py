@@ -291,6 +291,27 @@ def test_fit_patches_with_tangent_continuity():
     assert np.max(np.abs(left_edge - right_edge)) < 1e-10
 
 
+def test_patch_ranges_cover_every_sample():
+    """多块拟合的块范围必须覆盖全部采样（回归：最后一块曾丢末行/列）。"""
+    from geometry.facets import _patch_ranges
+    for n, p in [(7, 2), (9, 3), (10, 3), (11, 3), (13, 4), (12, 6)]:
+        covered = {i for a, b in _patch_ranges(n, p) for i in range(a, b)}
+        assert covered == set(range(n)), (n, p)
+
+
+def test_fit_patches_reach_grid_border():
+    """多块拟合的面片必须到达真实外边界（曾截断至倒数第二个采样）。"""
+    reflector = _reflector(1, 1)
+    reflector.fit_patches_u = 2
+    reflector.fit_patches_v = 2
+    facets = generate_facets(reflector)
+    corners = np.vstack([f.corners for f in facets])
+    assert abs(corners[:, 0].max() - 2.0) < 1e-9
+    assert abs(corners[:, 0].min() + 2.0) < 1e-9
+    assert abs(corners[:, 1].max() - 2.0) < 1e-9
+    assert abs(corners[:, 1].min() + 2.0) < 1e-9
+
+
 def test_approximate_keep_size_stays_inside_base_grid():
     reflector = _reflector(1, 1)
     reflector.mesh_u = 9
@@ -349,6 +370,8 @@ if __name__ == "__main__":
     test_no_gap_old_border_changes_old_facet()
     test_step_back_no_gap_applies_z_steps()
     test_fit_patches_with_tangent_continuity()
+    test_patch_ranges_cover_every_sample()
+    test_fit_patches_reach_grid_border()
     test_approximate_keep_size_stays_inside_base_grid()
     test_no_gap_borders_close_in_both_u_and_v()
     print("OK – engine feature tests passed.")

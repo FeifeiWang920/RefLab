@@ -1,4 +1,4 @@
-# mf_reflector – development dependencies
+# RefLab – development dependencies
 # Install on top of requirements.txt:
 #   pip install -r requirements.txt -r requirements-dev.txt
 

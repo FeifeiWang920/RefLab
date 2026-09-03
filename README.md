@@ -118,4 +118,4 @@ reflab/
 
 本项目基于 [MIT License](LICENSE) 开源。
 
-> **商标声明**：LucidShape® 与 CATIA® 是 SYNOPSYS 与 Dassault Systèmes 各自的商标。本项目为依据公开文档独立实现的兼容工具，与上述公司无任何隶属或背书关系；相关商标仅在描述兼容性时作指代使用。
+> **商标声明**：LucidShape® 与 CATIA® 是 Keysight 与 Dassault Systèmes 各自的商标。本项目为依据公开文档独立实现的兼容工具，与上述公司无任何隶属或背书关系；相关商标仅在描述兼容性时作指代使用。

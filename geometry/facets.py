@@ -160,10 +160,9 @@ def _patch_ranges(n_samples: int, n_patches: int) -> List[Tuple[int, int]]:
     starts = [0]
     for i in range(n_patches):
         starts.append(starts[-1] + base + (1 if i < extra else 0))
-    return [
-        (starts[i], starts[i + 1] + (1 if i + 1 < n_patches else 0))
-        for i in range(n_patches)
-    ]
+    # 相邻块共享边界采样（区间含端点），最后一块终点 = n_samples。
+    # 若最后一块不加 +1，网格最后一行/列不属于任何块——面片远端边界被截断。
+    return [(starts[i], starts[i + 1] + 1) for i in range(n_patches)]
 
 
 def _make_facet_patches(

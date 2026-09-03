@@ -56,5 +56,53 @@ def test_detect_catia_never_launches(monkeypatch):
     assert calls == ["GetActiveObject"], f"探测路径不得调用 Dispatch，实际: {calls}"
 
 
+def test_import_proceeds_when_active_doc_is_not_part(monkeypatch, tmp_path):
+    """NOT_PART / NO_ACTIVE_DOC 不得在入口被拒——承诺的自动新建 CATPart 必须被执行。"""
+    import catia.bridge as bridge
+
+    class _FakeDoc:
+        Name = "NewPart.CATPart"
+
+        class _Part:
+            pass
+
+        Part = _Part()
+
+    class _FakeDocuments:
+        Count = 0
+
+        def __init__(self):
+            self.added = None
+
+        def Add(self, kind):
+            self.added = kind
+            return _FakeDoc()
+
+    docs = _FakeDocuments()
+
+    class _FakeCatia:
+        Documents = docs
+
+    monkeypatch.setattr(
+        bridge, "detect_catia",
+        lambda: CatiaStatus(state=CatiaState.NOT_PART, message="not part"),
+    )
+    monkeypatch.setattr(bridge, "_get_catia", lambda allow_launch=False: _FakeCatia())
+
+    def _stop(catia, stp_path):
+        raise RuntimeError("STOP-marker")
+
+    monkeypatch.setattr(bridge, "_convert_step_to_catpart", _stop)
+
+    stp = tmp_path / "reflector.stp"
+    stp.write_text("stub", encoding="utf-8")
+    status = bridge.import_step_to_active_part(stp)
+
+    # 未在入口被拒（否则 message 是 detect 的 "not part"）；
+    # 自动建 Part 已执行，且流程推进到了 STEP 转换。
+    assert docs.added == "Part"
+    assert "STOP-marker" in status.message
+
+
 if __name__ == "__main__":
     test_detect()

@@ -312,8 +312,10 @@ def import_step_to_active_part(
         )
 
     status = detect_catia()
-    if not status.ok:
+    if status.state in (CatiaState.UNAVAILABLE, CatiaState.NOT_RUNNING):
         return status
+    # NOT_PART / NO_ACTIVE_DOC 继续走：下方 Documents.Add("Part") 会自动
+    # 新建 CATPart（与 detect 消息「Send 时将自动新建一个 CATPart 再导入」一致）。
 
     try:
         catia = _get_catia(allow_launch=True)
