@@ -69,16 +69,22 @@ def test_visual_theme_and_primary_button():
     assert status_relief in ("", "flat"), f"status bar should be flat, got {status_relief!r}"
 
     import tkinter.font as tkfont
+    from ui.main_window import UI_FONT_FAMILY, UI_FONT_SIZE, SV_TTK_FONTS
     for name in ("TkDefaultFont", "TkTextFont"):
         f = tkfont.nametofont(name)
-        assert f.cget("size") >= 12, f"{name} should be >= 12pt, got {f.cget('size')}"
+        assert f.cget("size") >= UI_FONT_SIZE, (
+            f"{name} should be >= {UI_FONT_SIZE}pt, got {f.cget('size')}"
+        )
         assert "yahei" in str(f.cget("family")).lower(), (
             f"{name} family should be Microsoft YaHei, got {f.cget('family')}"
         )
     # ttk 控件实际使用的字体（sv-ttk 用自己的 SunValleyBodyFont，必须一并覆盖）
     style_font = root.tk.call("ttk::style", "lookup", "TLabel", "-font")
     sf = tkfont.Font(root=root, name=str(style_font), exists=True)
-    assert sf.cget("size") >= 12, f"ttk TLabel font should be >= 12pt, got {sf.cget('size')}"
+    assert str(style_font) in SV_TTK_FONTS, f"unexpected ttk font: {style_font}"
+    assert sf.cget("size") == SV_TTK_FONTS[str(style_font)], (
+        f"ttk font size drifted: expected {SV_TTK_FONTS[str(style_font)]}, got {sf.cget('size')}"
+    )
     assert "yahei" in str(sf.cget("family")).lower(), (
         f"ttk TLabel font family should be Microsoft YaHei, got {sf.cget('family')}"
     )
@@ -86,6 +92,29 @@ def test_visual_theme_and_primary_button():
     root.destroy()
 
 
+def test_generate_runs_in_background():
+    root = tk.Tk()
+    root.withdraw()
+    app = MFReflectorApp(root)
+    root.update_idletasks()
+
+    app.on_apply()
+    # on_apply 应立即返回（未阻塞），且生成期间按钮禁用
+    assert app._gen_thread is not None and app._gen_thread.is_alive()
+    assert str(app.btn_generate.cget("state")) == "disabled"
+    assert str(app.btn_catia.cget("state")) == "disabled"
+
+    app._wait_for_generation(timeout=120)
+    assert app.reflector is not None and app.reflector.is_generated()
+    assert app._gen_thread is None
+    assert str(app.btn_generate.cget("state")) in ("normal", "")
+    assert str(app.btn_catia.cget("state")) in ("normal", "")
+    assert "生成" in str(app.status.cget("text"))
+
+    root.destroy()
+
+
 if __name__ == "__main__":
     test_tabbed_ui_and_dialogs()
+    test_generate_runs_in_background()
     print("OK – tabbed UI smoke test passed.")

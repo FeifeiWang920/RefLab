@@ -53,6 +53,18 @@ def _interp_angle_list(angles: Sequence[float], frac: float) -> float:
     return float(np.interp(frac, x, np.asarray(angles, dtype=float)))
 
 
+def _interp_angle_list_array(angles: Sequence[float], fracs: np.ndarray) -> np.ndarray:
+    """Vectorised `_interp_angle_list`: fracs is an array of local coords."""
+    fracs = np.asarray(fracs, dtype=float)
+    if not angles:
+        return np.zeros_like(fracs)
+    if len(angles) == 1:
+        return np.full(fracs.shape, float(angles[0]))
+    fracs = np.clip(fracs, 0.0, 1.0)
+    x = np.linspace(0.0, 1.0, len(angles))
+    return np.interp(fracs, x, np.asarray(angles, dtype=float))
+
+
 @dataclass
 class SpreadsConfig:
     """
@@ -142,6 +154,25 @@ class SpreadsConfig:
         h_list, v_list = self._lists_for_facet(i_u, i_v)
         h = _interp_angle_list(h_list, local_u)
         v = _interp_angle_list(v_list, local_v)
+        h = h * self.global_scale_h + self.global_shift_h
+        v = v * self.global_scale_v + self.global_shift_v
+        return h, v
+
+    def target_angles_on_facet_grid(
+        self,
+        i_u: int,
+        i_v: int,
+        local_u,
+        local_v,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vectorised `target_angles_on_facet`: local_u / local_v may be arrays
+        of any matching shape; returns (H, V) arrays of the same shape with
+        identical per-node semantics.
+        """
+        h_list, v_list = self._lists_for_facet(i_u, i_v)
+        h = _interp_angle_list_array(h_list, local_u)
+        v = _interp_angle_list_array(v_list, local_v)
         h = h * self.global_scale_h + self.global_shift_h
         v = v * self.global_scale_v + self.global_shift_v
         return h, v

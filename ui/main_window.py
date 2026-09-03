@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +63,22 @@ def _system_dpi() -> float:
         return 96.0
 
 
+# sv-ttk 主题字体 → 字号（pt）。sv-ttk 自带的 SunValley*Font 是 11pt Segoe UI，
+# 必须整体覆盖为微软雅黑；改字号只需改这张表。
+SV_TTK_FONTS = {
+    "SunValleyBodyFont": 11,        # 正文：所有标签、输入框、下拉框
+    "SunValleyBodyStrongFont": 12,  # 加粗正文：按钮文字
+    "SunValleyBodyLargeFont": 12,   # 大号正文
+    "SunValleyCaptionFont": 10,     # 小字说明（灰色提示、单位 mm/°）
+    "SunValleySubtitleFont": 12,    # 副标题
+    "SunValleyTitleFont": 14,       # 标题
+    "SunValleyTitleLargeFont": 16,  # 大标题
+    "SunValleyDisplayFont": 18,     # 展示级大字
+}
+UI_FONT_FAMILY = "Microsoft YaHei UI"
+UI_FONT_SIZE = 12
+
+
 class MFReflectorApp:
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
@@ -79,6 +96,8 @@ class MFReflectorApp:
         self.reflector: Optional[MFReflector] = None
         self.catia_status: CatiaStatus = detect_catia()
         self._fstart_dialog: Optional["tk.Toplevel"] = None
+        self._gen_thread: Optional["threading.Thread"] = None
+        self._gen_result: tuple = (None, None)
         self._hint_labels: list = []
         self._design_columns: Optional[tuple] = None
         self._apply_visual_theme()
@@ -110,18 +129,8 @@ class MFReflectorApp:
         import tkinter.font as tkfont
 
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=12)
-        sv_fonts = {
-            "SunValleyBodyFont": 11,        # 正文：所有标签、输入框、下拉框
-            "SunValleyBodyStrongFont": 12,  # 加粗正文：按钮文字
-            "SunValleyBodyLargeFont": 12,   # 大号正文
-            "SunValleyCaptionFont": 10,     # 小字说明（灰色提示、单位 mm/°）
-            "SunValleySubtitleFont": 12,    # 副标题
-            "SunValleyTitleFont": 14,       # 标题
-            "SunValleyTitleLargeFont": 16,  # 大标题
-            "SunValleyDisplayFont": 18,     # 展示级大字
-        }
-        for name, size in sv_fonts.items():
+            tkfont.nametofont(name).configure(family=UI_FONT_FAMILY, size=UI_FONT_SIZE)
+        for name, size in SV_TTK_FONTS.items():
             try:
                 tkfont.Font(root=self.root, name=name, exists=True).configure(
                     family="Microsoft YaHei UI", size=size
@@ -823,15 +832,74 @@ class MFReflectorApp:
         )
 
     def on_apply(self) -> None:
+        # 后台线程执行生成，避免大网格时冻结 UI。结果经 _poll_generation 落地。
+        if self._gen_thread is not None and self._gen_thread.is_alive():
+            self.status.config(text="正在生成中…请等待完成。")
+            return
         try:
             self.reflector = self._collect()
-            generate_facets(self.reflector)
-            n_opt = sum(1 for f in self.reflector.facets if not f.is_gap_surface)
-            n_gap = sum(1 for f in self.reflector.facets if f.is_gap_surface)
-            self.status.config(text=f"已生成 {n_opt} 个 NURBS 光学面 + {n_gap} 个缝面。")
         except Exception as exc:
             messagebox.showerror("生成失败", str(exc))
             self.status.config(text="生成失败。")
+            return
+        self._set_busy(True)
+        self.status.config(text="正在生成反射面…")
+
+        def work():
+            try:
+                generate_facets(self.reflector)
+                n_opt = sum(1 for f in self.reflector.facets if not f.is_gap_surface)
+                n_gap = sum(1 for f in self.reflector.facets if f.is_gap_surface)
+                self._gen_result = (f"已生成 {n_opt} 个 NURBS 光学面 + {n_gap} 个缝面。", None)
+            except Exception as exc:
+                self._gen_result = (None, exc)
+
+        self._gen_thread = threading.Thread(target=work, daemon=True)
+        self._gen_thread.start()
+        self.root.after(50, self._poll_generation)
+
+    def _set_busy(self, busy: bool) -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.btn_generate.config(state=state)
+        self.btn_catia.config(state=state)
+
+    def _poll_generation(self) -> None:
+        thread = self._gen_thread
+        if thread is not None and thread.is_alive():
+            self.root.after(50, self._poll_generation)
+            return
+        msg, err = self._gen_result
+        self._gen_thread = None
+        self._gen_result = (None, None)
+        self._set_busy(False)
+        if err is not None:
+            messagebox.showerror("生成失败", str(err))
+            self.status.config(text="生成失败。")
+        else:
+            self.status.config(text=msg)
+
+    def _wait_for_generation(self, timeout: float = 120.0) -> None:
+        """测试/脚本辅助：泵事件循环直到后台生成结束。"""
+        import time as _time
+
+        deadline = _time.time() + timeout
+        while self._gen_thread is not None and self._gen_thread.is_alive():
+            if _time.time() >= deadline:
+                raise TimeoutError("generation did not finish in time")
+            try:
+                self.root.update()
+            except tk.TclError:
+                break
+            _time.sleep(0.01)
+        # 再泵几轮让 after 回调把结果与按钮状态落地
+        for _ in range(20):
+            try:
+                self.root.update()
+            except tk.TclError:
+                break
+            if self._gen_thread is None:
+                break
+            _time.sleep(0.01)
 
     def on_export_stl(self) -> None:
         if not self._ensure_generated():
@@ -869,10 +937,13 @@ class MFReflectorApp:
                 messagebox.showerror("STEP 导出失败", str(exc))
 
     def on_send_catia(self) -> None:
+        if self._gen_thread is not None and self._gen_thread.is_alive():
+            self.status.config(text="正在生成…完成后再发送到 CATIA。")
+            return
         if not self.reflector or not self.reflector.is_generated():
             self.on_apply()
-            if not self.reflector or not self.reflector.is_generated():
-                return
+            self.status.config(text="已开始后台生成，完成后再发送到 CATIA。")
+            return
         self._refresh_catia_status()
         if not self.catia_status.can_send:
             messagebox.showwarning("CATIA", self.catia_status.message)

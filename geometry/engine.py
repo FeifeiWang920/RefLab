@@ -119,7 +119,20 @@ def _slopes_from_normals(N: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _eval_target_grid(target_fn, su: int, sv: int) -> Tuple[np.ndarray, np.ndarray]:
-    """target_fn(li, lj) does not depend on height — evaluate once per solve."""
+    """target_fn(li, lj) does not depend on height — evaluate once per solve.
+
+    target_fn 要么支持整网格数组输入（向量化路径），要么退回逐节点循环。
+    形状校验保证错误形状的返回值不会被误用。
+    """
+    LI, LJ = np.meshgrid(np.arange(su), np.arange(sv))  # (sv, su)
+    try:
+        hs, vs = target_fn(LI, LJ)
+        hs = np.asarray(hs, dtype=float)
+        vs = np.asarray(vs, dtype=float)
+        if hs.shape == (sv, su) and vs.shape == (sv, su):
+            return hs, vs
+    except (TypeError, ValueError, IndexError):
+        pass
     hs = np.empty((sv, su), dtype=float)
     vs = np.empty((sv, su), dtype=float)
     for lj in range(sv):
@@ -137,8 +150,21 @@ def _slopes_on_surface(
     v_deg: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     xx, yy = np.meshgrid(xs, ys)
-    pts = np.stack((xx, yy, z), axis=-1)
     targets = _target_direction_from_angles(h_deg, v_deg)
+    pts = np.stack((xx, yy, z), axis=-1)
+    return _slopes_from_normals(_required_normals(source, pts, targets))
+
+
+def _slopes_on_surface_static(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    z: np.ndarray,
+    source: np.ndarray,
+    targets: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """`_slopes_on_surface` with the grid mesh and target directions hoisted
+    out of the caller's iteration loop (only z changes per iteration)."""
+    pts = np.stack((xx, yy, z), axis=-1)
     return _slopes_from_normals(_required_normals(source, pts, targets))
 
 
@@ -352,14 +378,24 @@ def _target_fn_from_fracs(spreads, iu: int, iv: int, frac_u: np.ndarray, frac_v:
     fu = np.asarray(frac_u, dtype=float)
     fv = np.asarray(frac_v, dtype=float)
 
-    def fn(li: int, lj: int, fu=fu, fv=fv, iu=iu, iv=iv) -> Tuple[float, float]:
+    def fn(li, lj, fu=fu, fv=fv, iu=iu, iv=iv):
+        array_input = np.ndim(li) > 0 or np.ndim(lj) > 0
         if fu.ndim == 2:
-            j = int(np.clip(lj, 0, fu.shape[0] - 1))
-            i = int(np.clip(li, 0, fu.shape[1] - 1))
-            return spreads.target_angles_on_facet(iu, iv, float(fu[j, i]), float(fv[j, i]))
-        i = int(np.clip(li, 0, fu.size - 1))
-        j = int(np.clip(lj, 0, fv.size - 1))
-        return spreads.target_angles_on_facet(iu, iv, float(fu[i]), float(fv[j]))
+            j = np.clip(lj, 0, fu.shape[0] - 1)
+            i = np.clip(li, 0, fu.shape[1] - 1)
+            if array_input:
+                return spreads.target_angles_on_facet_grid(
+                    iu, iv, fu[j.astype(int), i.astype(int)],
+                    fv[j.astype(int), i.astype(int)],
+                )
+            return spreads.target_angles_on_facet(
+                iu, iv, float(fu[int(j), int(i)]), float(fv[int(j), int(i)])
+            )
+        i = np.clip(li, 0, fu.size - 1).astype(int)
+        j = np.clip(lj, 0, fv.size - 1).astype(int)
+        if array_input:
+            return spreads.target_angles_on_facet_grid(iu, iv, fu[i], fv[j])
+        return spreads.target_angles_on_facet(iu, iv, float(fu[int(i)]), float(fv[int(j)]))
 
     return fn
 
@@ -708,6 +744,113 @@ def _reconstruct_height_separable(
     return float(z_seed) + F[None, :] + G[:, None]
 
 
+class _SlopeHeightSolver:
+    """Pre-factorised least-squares height reconstruction for one facet grid.
+
+    The weighted design matrix depends only on the grid geometry
+    (xs, ys, edge_weight, seed) — never on the slopes — so the linear map
+    from slope fields to heights is factorised once and every subsequent
+    solve reduces to building the right-hand side plus one matvec.
+    Degenerate grids (rank-deficient normal equations) fall back to the
+    SVD lstsq path, matching the historical behaviour.
+    """
+
+    def __init__(
+        self,
+        x_coords: Sequence[float],
+        y_coords: Sequence[float],
+        z_seed: float,
+        seed_i: int,
+        seed_j: int,
+        edge_weight: float = 2.5,
+    ) -> None:
+        xs = np.asarray(x_coords, dtype=float)
+        ys = np.asarray(y_coords, dtype=float)
+        nv = int(ys.size)
+        nu = int(xs.size)
+        N = nv * nu
+        self.nv, self.nu, self.N = nv, nu, N
+
+        n_eq = nv * (nu - 1) + (nv - 1) * nu
+        A = np.zeros((n_eq, N))
+        w = np.ones(n_eq)
+        # Interval slope = average of the two node slopes (trapezoid rule).
+        # Using only the left/bottom node systematically under-steers the
+        # surface and packs rays toward the mean angle (hot centre + soft edge).
+        # Boundary intervals get a higher weight so the rectangular far-field
+        # outline is honoured even when the slope field is not conservative.
+        edge_w = float(edge_weight) if edge_weight is not None else 2.5
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+        # 行序与历史实现一致：先全部 x 行（j 外层、i 内层，跳过 dx<=0），后 y 行。
+        x_ok = dx > 0.0
+        y_ok = dy > 0.0
+        k = 0
+        for j in range(nv):
+            wrow = edge_w if (j == 0 or j == nv - 1) else 1.0
+            for i in range(nu - 1):
+                if not x_ok[i]:
+                    continue
+                A[k, j * nu + i + 1] = 1.0 / dx[i]
+                A[k, j * nu + i] = -1.0 / dx[i]
+                w[k] = wrow * (edge_w if (i == 0 or i == nu - 2) else 1.0)
+                k += 1
+        for j in range(nv - 1):
+            for i in range(nu):
+                if not y_ok[j]:
+                    continue
+                A[k, (j + 1) * nu + i] = 1.0 / dy[j]
+                A[k, j * nu + i] = -1.0 / dy[j]
+                wcol = edge_w if (i == 0 or i == nu - 1) else 1.0
+                w[k] = wcol * (edge_w if (j == 0 or j == nv - 2) else 1.0)
+                k += 1
+        A = A[:k]
+        w = w[:k]
+        sw = np.sqrt(w)
+        A = A * sw[:, None]
+
+        # 行选择索引：把 (dzx, dzy) 展平后的 b 直接映射到保留的方程行。
+        # True 的个数恰为 k（保留的方程行数），与 A 的行序一致。
+        self._sel = np.concatenate((
+            np.tile(x_ok, nv),
+            np.repeat(y_ok, nu),
+        ))
+        self._sw_sel = sw
+
+        # Fix the seed height (Dirichlet constraint): solve for the other nodes.
+        mask = np.ones(N, dtype=bool)
+        mask[seed_j * nu + seed_i] = False
+        self._mask = mask
+        Am = A[:, mask]
+        self._seed_part = A[:, ~mask].ravel() * float(z_seed)
+        self._z_seed = float(z_seed)
+
+        # 预分解：K = (AmᵀAm)⁻¹ Amᵀ，每次 solve 只需一次 matvec。
+        # 数值上与 SVD lstsq 同解（差 ~κ·eps）；正规方程奇异时退回 lstsq。
+        self._K: Optional[np.ndarray] = None
+        self._Am: Optional[np.ndarray] = None
+        try:
+            G = Am.T @ Am
+            self._K = np.linalg.inv(G) @ Am.T
+        except np.linalg.LinAlgError:
+            self._Am = Am
+
+    def solve(self, dzx: np.ndarray, dzy: np.ndarray) -> np.ndarray:
+        nv, nu, N = self.nv, self.nu, self.N
+        bx = 0.5 * (dzx[:, :-1] + dzx[:, 1:])
+        by = 0.5 * (dzy[:-1, :] + dzy[1:, :])
+        b_all = np.concatenate((bx.ravel(), by.ravel()))
+        bm = self._sw_sel * b_all[self._sel] - self._seed_part
+        if self._K is not None:
+            sol = self._K @ bm
+        else:
+            sol, *_ = np.linalg.lstsq(self._Am, bm, rcond=None)
+        z = np.zeros(N)
+        z[~self._mask] = self._z_seed
+        z[self._mask] = sol
+        return z.reshape(nv, nu)
+
+
 def _reconstruct_height_from_slopes(
     dzx: np.ndarray,
     dzy: np.ndarray,
@@ -716,7 +859,6 @@ def _reconstruct_height_from_slopes(
     z_seed: float,
     seed_i: int,
     seed_j: int,
-    iterations: int = 40,
     edge_weight: float = 2.5,
 ) -> np.ndarray:
     """
@@ -729,62 +871,12 @@ def _reconstruct_height_from_slopes(
              + sum_j,i ( (z[j+1,i]-z[j,i])/dy - dzy[j,i] )^2
     subject to z[seed] = z_seed.  This yields the smoothest surface that best
     honours the desired slopes and replaces the old ad-hoc Southwell sweeps.
+
+    单次求解的便捷入口；迭代求解请复用 `_SlopeHeightSolver` 以摊销分解成本。
     """
-    nv, nu = dzx.shape
-    N = nv * nu
-    xs = np.asarray(x_coords, dtype=float)
-    ys = np.asarray(y_coords, dtype=float)
-
-    n_eq = nv * (nu - 1) + (nv - 1) * nu
-    A = np.zeros((n_eq, N))
-    b = np.zeros(n_eq)
-    w = np.ones(n_eq)
-    k = 0
-    # Interval slope = average of the two node slopes (trapezoid rule).
-    # Using only the left/bottom node systematically under-steers the
-    # surface and packs rays toward the mean angle (hot centre + soft edge).
-    # Boundary intervals get a higher weight so the rectangular far-field
-    # outline is honoured even when the slope field is not conservative.
-    edge_w = float(edge_weight) if edge_weight is not None else 2.5
-    for j in range(nv):
-        wrow = edge_w if (j == 0 or j == nv - 1) else 1.0
-        for i in range(nu - 1):
-            dx = xs[i + 1] - xs[i]
-            if dx <= 0.0:
-                continue
-            A[k, j * nu + i + 1] = 1.0 / dx
-            A[k, j * nu + i] = -1.0 / dx
-            b[k] = 0.5 * (dzx[j, i] + dzx[j, i + 1])
-            w[k] = wrow * (edge_w if (i == 0 or i == nu - 2) else 1.0)
-            k += 1
-    for j in range(nv - 1):
-        for i in range(nu):
-            dy = ys[j + 1] - ys[j]
-            if dy <= 0.0:
-                continue
-            A[k, (j + 1) * nu + i] = 1.0 / dy
-            A[k, j * nu + i] = -1.0 / dy
-            b[k] = 0.5 * (dzy[j, i] + dzy[j + 1, i])
-            wcol = edge_w if (i == 0 or i == nu - 1) else 1.0
-            w[k] = wcol * (edge_w if (j == 0 or j == nv - 2) else 1.0)
-            k += 1
-    A = A[:k]
-    b = b[:k]
-    w = w[:k]
-    sw = np.sqrt(w)
-    A = A * sw[:, None]
-    b = b * sw
-
-    # Fix the seed height (Dirichlet constraint): solve for the other nodes.
-    mask = np.ones(N, dtype=bool)
-    mask[seed_j * nu + seed_i] = False
-    Am = A[:, mask]
-    bm = b - (A[:, ~mask] * z_seed).ravel()
-    sol, *_ = np.linalg.lstsq(Am, bm, rcond=None)
-    z = np.zeros(N)
-    z[~mask] = z_seed
-    z[mask] = sol
-    return z.reshape(nv, nu)
+    return _SlopeHeightSolver(
+        x_coords, y_coords, z_seed, seed_i, seed_j, edge_weight
+    ).solve(dzx, dzy)
 
 
 def _build_height_field(reflector: MFReflector):
@@ -1383,31 +1475,24 @@ def _solve_facet_optical(
     tol = max(0.0, float(reflector.solver_tolerance))
     z_loc = np.asarray(z_init, dtype=float).copy()
     h_grid, v_grid = _eval_target_grid(target_fn, su, sv)
+    # 设计矩阵只依赖网格几何：整个迭代序列复用一次预分解。
+    ls_solver = _SlopeHeightSolver(xs, ys, z_seed, seed_i, seed_j, edge_weight=2.5)
+    # 网格坐标与目标方向在迭代间不变，一并提到循环外。
+    xx, yy = np.meshgrid(xs, ys)
+    targets = _target_direction_from_angles(h_grid, v_grid)
     use_sep = bool(getattr(reflector.spreads, "uniform_intensity", False))
     for _ in range(max_iter):
-        dzx, dzy = _slopes_on_surface(xs, ys, z_loc, source, h_grid, v_grid)
+        dzx, dzy = _slopes_on_surface_static(xx, yy, z_loc, source, targets)
         if use_sep:
             z_u = _reconstruct_height_by_paths(
                 dzx, dzy, xs, ys, z_seed, seed_i, seed_j, SolveMethod.U_FIRST,
             )
-            z_ls = _reconstruct_height_from_slopes(
-                dzx, dzy, xs, ys,
-                z_seed=z_seed,
-                seed_i=seed_i, seed_j=seed_j,
-                iterations=30,
-                edge_weight=2.5,
-            )
+            z_ls = ls_solver.solve(dzx, dzy)
             # Paths keep iso-V from smiling; LS keeps a single smooth
             # graph.  FFD border-lock + heavy polish sprayed the corners.
             z_new = 0.35 * z_u + 0.65 * z_ls
         else:
-            z_new = _reconstruct_height_from_slopes(
-                dzx, dzy, xs, ys,
-                z_seed=z_seed,
-                seed_i=seed_i, seed_j=seed_j,
-                iterations=30,
-                edge_weight=2.5,
-            )
+            z_new = ls_solver.solve(dzx, dzy)
         delta = float(np.max(np.abs(z_new - z_loc)))
         z_loc = z_new
         if delta <= tol:
@@ -1671,8 +1756,12 @@ def _spatial_intensity_inverse(
     asked_v[0] = v0
     asked_v[-1] = v1
 
-    def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
-        return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
+    def fn(li, lj, ah=asked_h, av=asked_v):
+        ci = np.clip(li, 0, su - 1)
+        cj = np.clip(lj, 0, sv - 1)
+        if np.ndim(li) > 0 or np.ndim(lj) > 0:
+            return ah[ci.astype(int)], av[cj.astype(int)]
+        return float(ah[int(ci)]), float(av[int(cj)])
 
     return _row_h_preemphasis(fn, realized_h, h0, h1, gain=0.55)
 
@@ -1703,10 +1792,15 @@ def _row_h_preemphasis(
     mid = 0.5 * (float(h0) + float(h1))
     half = 0.5 * abs(want) * 1.12
 
-    def fn(li: int, lj: int, inner=inner_fn, sc=scale, mid=mid, half=half):
+    def fn(li, lj, inner=inner_fn, sc=scale, mid=mid, half=half):
         h, v = inner(li, lj)
-        s = float(sc[int(np.clip(lj, 0, sc.size - 1))])
-        return float(np.clip(mid + s * (h - mid), mid - half, mid + half)), v
+        cj = np.clip(lj, 0, sc.size - 1)
+        if np.ndim(li) > 0 or np.ndim(lj) > 0:
+            s = sc[cj.astype(int)]
+        else:
+            s = float(sc[int(cj)])
+            return float(np.clip(mid + s * (h - mid), mid - half, mid + half)), v
+        return np.clip(mid + s * (h - mid), mid - half, mid + half), v
 
     return fn
 
@@ -1797,8 +1891,12 @@ def _energy_separable_inverse(
     asked_v[0] = v0
     asked_v[-1] = v1
 
-    def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
-        return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
+    def fn(li, lj, ah=asked_h, av=asked_v):
+        ci = np.clip(li, 0, su - 1)
+        cj = np.clip(lj, 0, sv - 1)
+        if np.ndim(li) > 0 or np.ndim(lj) > 0:
+            return ah[ci.astype(int)], av[cj.astype(int)]
+        return float(ah[int(ci)]), float(av[int(cj)])
 
     return fn
 
@@ -1870,8 +1968,12 @@ def _separable_inverse_target(
     if sv >= 3:
         asked_v[1:-1] = 0.25 * asked_v[:-2] + 0.50 * asked_v[1:-1] + 0.25 * asked_v[2:]
 
-    def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
-        return float(ah[int(np.clip(li, 0, su - 1))]), float(av[int(np.clip(lj, 0, sv - 1))])
+    def fn(li, lj, ah=asked_h, av=asked_v):
+        ci = np.clip(li, 0, su - 1)
+        cj = np.clip(lj, 0, sv - 1)
+        if np.ndim(li) > 0 or np.ndim(lj) > 0:
+            return ah[ci.astype(int)], av[cj.astype(int)]
+        return float(ah[int(ci)]), float(av[int(cj)])
 
     return fn
 
@@ -2085,8 +2187,10 @@ def _solve_facet_with_borders(
             idx = 0 if side == "bottom" else sv - 1
             z_loc[idx, :] = arr
     h_grid, v_grid = _eval_target_grid(spread_target, su, sv)
+    xx, yy = np.meshgrid(xs, ys)
+    targets = _target_direction_from_angles(h_grid, v_grid)
     for _ in range(max_iter):
-        dzx, dzy = _slopes_on_surface(xs, ys, z_loc, source, h_grid, v_grid)
+        dzx, dzy = _slopes_on_surface_static(xx, yy, z_loc, source, targets)
         z_new = _ls_reconstruct_with_borders(dzx, dzy, xs, ys, zb)
         delta = float(np.max(np.abs(z_new - z_loc)))
         z_loc = z_new
