@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Golden-master regression test for the height-field solver.
 
 The .npz baseline is captured with the pre-optimisation engine (see

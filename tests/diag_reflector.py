@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Final verification: fitted-NURBS reflection-angle accuracy + C0 borders + edge cases."""
 import sys
 from pathlib import Path

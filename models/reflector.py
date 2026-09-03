@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 MFReflector aggregate – the main design object.
 """

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Test NURBS facets + Gap Surface mode."""
 
 from __future__ import annotations

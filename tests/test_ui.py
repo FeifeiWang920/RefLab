@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Headless smoke tests for the tabbed Tk UI."""
 
 from __future__ import annotations
@@ -5,16 +6,21 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-try:
-    import tkinter as tk
-except ImportError:
-    raise SystemExit("tkinter is unavailable; UI smoke test skipped")
+tk = pytest.importorskip("tkinter", reason="tkinter is unavailable; UI smoke tests skipped")
 
 from models import GapType, PatchContinuity, PatchFitMethod, SolveMethod
 from ui.main_window import MFReflectorApp
+
+# 主题与字体断言依赖 Windows 系统主题栈（Vista/sv-ttk + Microsoft YaHei UI）
+win_only = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="sun-valley theme / YaHei font assertions are Windows-specific",
+)
 
 
 def test_tabbed_ui_and_dialogs():
@@ -56,6 +62,7 @@ def test_tabbed_ui_and_dialogs():
     root.destroy()
 
 
+@win_only
 def test_visual_theme_and_primary_button():
     root = tk.Tk()
     root.withdraw()

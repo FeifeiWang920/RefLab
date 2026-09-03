@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Light source models (LucidShape Source dialog – simplified for point source)."""
 
 from __future__ import annotations

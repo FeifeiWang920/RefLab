@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: MIT
 """
-Tkinter UI for MF Reflector (v0.11 – L1 three-tab layout).
+Tkinter UI for RefLab (L1 three-tab layout).
 
 Visual/IA upgrade only. Same parameters, same _collect() semantics.
+Version is maintained solely in the project __init__.py.
 """
 
 from __future__ import annotations
@@ -82,7 +84,7 @@ UI_FONT_SIZE = 12
 class MFReflectorApp:
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
-        self.root.title("MF Reflector")
+        self.root.title("RefLab")
         self._dpi = _system_dpi()
         self._scale = max(1.0, self._dpi / 96.0)
         try:

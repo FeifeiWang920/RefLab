@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Pure-NumPy B-spline surface utilities with *global interpolation*.
 

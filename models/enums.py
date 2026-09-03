@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Enumerations aligned with LucidShape FunGeo MacroFocal 2024.09 terminology.
 """

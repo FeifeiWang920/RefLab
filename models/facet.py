@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Single MacroFocal facet – supports planar corners and NURBS patch."""
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import numpy as np
 @dataclass
 class Facet:
     """
-    One optical facet of an MF Reflector.
+    One optical facet of a RefLab reflector.
 
     Geometry can be represented as:
       - corners (4 points) for quick preview

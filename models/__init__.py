@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Domain models for MacroFocal Reflector."""
 
 from .enums import (

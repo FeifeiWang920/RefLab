@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>MF Reflector 光学原理说明</title>
+<title>RefLab 光学原理说明</title>
 <style>
   :root {
     --ink: #1b1d21;
@@ -93,8 +93,8 @@
 
 <header>
   <div class="wrap">
-    <h1>MF Reflector 光学原理说明</h1>
-    <p>本文面向希望理解（或参与改进）求解器的使用者与开发者，解释 MF Reflector
+    <h1>RefLab 光学原理说明</h1>
+    <p>本文面向希望理解（或参与改进）求解器的使用者与开发者，解释 RefLab
     从「光源 + 面片网格 + 远场角度」到「可制造 NURBS 反射镜」的完整计算流程。</p>
   </div>
 </header>
@@ -163,7 +163,7 @@
   <h2>3. 逐面片求解：从坡度场到高度场</h2>
   <p>核心难点：按反射定律逐点算出的坡度场<strong>并不严格可积</strong>
   （∂²z/∂x∂y 在 x 方向与 y 方向的求值顺序不一致），直接沿路径积分会产生路径相关的褶皱。
-  MF Reflector 把它转化为一个<strong>最小二乘梯度匹配问题</strong>：</p>
+  RefLab 把它转化为一个<strong>最小二乘梯度匹配问题</strong>：</p>
   <div class="formula">
     min<sub>z</sub>　Σ ( (z<sub>j,i+1</sub>−z<sub>j,i</sub>)/Δx − dzx<sub>j,i</sub> )²
     + Σ ( (z<sub>j+1,i</sub>−z<sub>j,i</sub>)/Δy − dzy<sub>j,i</sub> )²，　z<sub>seed</sub> = 定值
@@ -247,7 +247,7 @@
 <!-- ================================================================ 5 -->
 <section>
   <h2>5. 缝隙系统</h2>
-  <p>实际灯具中面片之间要有缝隙（避让、散热、外观），MF Reflector 支持三种语义：</p>
+  <p>实际灯具中面片之间要有缝隙（避让、散热、外观），RefLab 支持三种语义：</p>
   <table>
     <tr><th>模式</th><th>含义</th><th>选项</th></tr>
     <tr><td><code>gap</code></td><td>面片光学尺寸按「宽/高 − 缝隙」收缩，缝隙处生成 ruled 缝隙面</td><td>empty（留空）/ surface（生成缝面）</td></tr>
@@ -310,7 +310,7 @@
 
 <footer>
   <div class="wrap">
-    MF Reflector · 光学原理说明 ·
+    RefLab · 光学原理说明 ·
     阅读本文后建议对照 <code>geometry/engine.py</code> 与
     <a href="../README.md" style="color:#1558a0">项目 README</a> 中的测试用例加深理解
   </div>

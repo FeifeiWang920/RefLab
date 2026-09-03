@@ -227,3 +227,7 @@ __marimo__/
 # Other files
 _fungeo_extract.txt
 Simulation
+.playwright-mcp
+# 项目内部文档（不得公开）
+UI升级开发文档_v0.3.docx
+ui_parameter_audit.html

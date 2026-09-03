@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 MacroFocal geometry engine (v0.8 – per-facet solver + Gap Surface).
 

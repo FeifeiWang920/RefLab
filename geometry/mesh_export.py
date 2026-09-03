@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Mesh conversion and file export (STL / OBJ)."""
 
 from __future__ import annotations

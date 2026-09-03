@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Test precise STEP export of NURBS reflector."""
 
 from __future__ import annotations
@@ -7,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
+import pytest
+
+pytest.importorskip("OCP", reason="cadquery/OCP not installed – STEP export tests skipped")
 from models import *
 from geometry import generate_facets, export_step
 

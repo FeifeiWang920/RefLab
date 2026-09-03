@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Spreads configuration – LucidShape MF facet spread semantics.
 

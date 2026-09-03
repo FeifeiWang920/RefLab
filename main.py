@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""MF Reflector entry point."""
+# SPDX-License-Identifier: MIT
+"""RefLab entry point."""
 
 from __future__ import annotations
 import os

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """CATIA bridge smoke test (safe on machines without CATIA)."""
 
 from __future__ import annotations

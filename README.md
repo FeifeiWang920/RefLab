@@ -1,8 +1,8 @@
-# MF Reflector
+# RefLab
 
-**MF Reflector**（MacroFocal Reflector）是一款开源的面片反射镜设计工具，采用 LucidShape MF（MacroFocal）风格的逐面片光学求解流程：输入光源位置、面片网格与远场角度分布，程序依据反射定律为每个面片独立求解高度场，拟合成真正的 NURBS 曲面，并可无缝导出为 STEP / STL / OBJ，或直接发送到正在运行的 CATIA V5 会话。
+**RefLab**（Reflector Lab，反射器实验室）是一款开源的面片反射镜设计工具，采用 LucidShape MF（MacroFocal）风格的逐面片光学求解流程：输入光源位置、面片网格与远场角度分布，程序依据反射定律为每个面片独立求解高度场，拟合成真正的 NURBS 曲面，并可无缝导出为 STEP / STL / OBJ，或直接发送到正在运行的 CATIA V5 会话。
 
-![MF Reflector 主界面](docs/screenshot_main.png)
+![RefLab 主界面](docs/screenshot_main.png)
 
 ## 功能特性
 
@@ -32,8 +32,8 @@
 ## 安装
 
 ```bash
-git clone https://github.com/<your-org>/reflector-mf.git
-cd reflector-mf
+git clone https://github.com/FeifeiWang920/RefLab.git
+cd RefLab
 
 # 建议使用虚拟环境
 python -m venv .venv
@@ -90,7 +90,7 @@ python main.py
 ## 目录结构
 
 ```
-reflector-mf/
+reflab/
 ├── main.py              # 程序入口
 ├── ui/                  # Tkinter 界面（sv-ttk 主题）
 ├── models/              # 数据模型（光源、网格、缝隙、远场、面片）
@@ -107,3 +107,5 @@ reflector-mf/
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
+
+> **商标声明**：LucidShape® 与 CATIA® 是 SYNOPSYS 与 Dassault Systèmes 各自的商标。本项目为依据公开文档独立实现的兼容工具，与上述公司无任何隶属或背书关系；相关商标仅在描述兼容性时作指代使用。

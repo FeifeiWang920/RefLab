@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Golden-master capture utility for the height-field solver.
 
 Builds reflectors for a fixed parameter matrix and dumps every solved

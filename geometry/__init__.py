@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Geometry generation, NURBS and export."""
 
 import os

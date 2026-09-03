@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Base Grid / Grid Layout
 Supports both uniform size and variable width_deltas / height_deltas (params.py style).

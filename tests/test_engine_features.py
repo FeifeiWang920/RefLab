@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Tests for per-facet solver, F.Start steps, gaps, and patch fitting."""
 
 from __future__ import annotations

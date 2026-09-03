@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Precise STEP export of NURBS facets via OpenCascade (OCP / cadquery-ocp).
 

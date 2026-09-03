@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """CATIA V5 integration – detect running session and import STEP into active Part."""
 
 from .bridge import (

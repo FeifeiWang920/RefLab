@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 Gaps configuration
 Aligned with LucidShape Gaps dialog (p.54–59).

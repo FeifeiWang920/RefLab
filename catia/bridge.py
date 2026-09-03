@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 CATIA V5 COM bridge.
 
