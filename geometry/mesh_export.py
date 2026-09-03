@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from typing import List, Tuple
+import warnings
+
 import numpy as np
 
 from models.facet import Facet
@@ -28,6 +30,11 @@ def facets_to_mesh(facets: List[Facet]) -> Tuple[np.ndarray, np.ndarray]:
 
         # Guard: if points length does not match expected grid, fall back
         if pts.shape[0] != nu * nv:
+            warnings.warn(
+                f"facet ({f.index_u},{f.index_v}) 采样点数 {pts.shape[0]} 与 "
+                f"{nu}x{nv} 网格不符，已退化为 4 角两三角形导出",
+                stacklevel=2,
+            )
             nu, nv = 2, 2
             pts = f.corners
 

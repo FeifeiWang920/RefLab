@@ -14,11 +14,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, List
+from typing import Any
+import logging
 import os
 import sys
 import tempfile
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class CatiaState(str, Enum):
@@ -60,17 +63,26 @@ def is_available() -> bool:
         return False
 
 
-def _get_catia():
+def _get_catia(allow_launch: bool = False):
+    """连接正在运行的 CATIA 会话。
+
+    默认（探测路径）只做 GetActiveObject，绝不拉起新的 CATIA 进程；
+    仅显式发送动作应传 allow_launch=True 允许 Dispatch 启动 CATIA。
+    """
     import win32com.client
     import pythoncom
     pythoncom.CoInitialize()
     try:
         return win32com.client.GetActiveObject("CATIA.Application")
-    except Exception:
-        try:
-            return win32com.client.Dispatch("CATIA.Application")
-        except Exception:
+    except Exception as exc:
+        logger.debug("GetActiveObject('CATIA.Application') 失败: %s", exc)
+        if not allow_launch:
             return None
+    try:
+        return win32com.client.Dispatch("CATIA.Application")
+    except Exception as exc:
+        logger.debug("Dispatch('CATIA.Application') 失败: %s", exc)
+        return None
 
 
 def detect_catia() -> CatiaStatus:
@@ -167,15 +179,16 @@ def _select_geometry(doc) -> int:
                 count += 1
         if count:
             return count
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("HybridShapes 直接选择失败，转用 Search 查询: %s", exc)
 
     for q in _SEARCH_QUERIES:
         try:
             sel.Search(q)
             if sel.Count > 0:
                 return int(sel.Count)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Selection.Search(%r) 失败: %s", q, exc)
             continue
     # Fallback: try to add MainBody / HybridBodies explicitly
     try:
@@ -212,24 +225,25 @@ def _ensure_hybrid_body(part, name: str = "MF_Reflector"):
     hbs = part.HybridBodies
     try:
         return hbs.Item(name)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("HybridBody %r 不存在，将新建: %s", name, exc)
     hb = hbs.Add()
     try:
         hb.Name = name
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("HybridBody 重命名为 %r 失败: %s", name, exc)
     return hb
 
 
 def _close_doc(catia, doc) -> None:
     try:
         doc.Close()
-    except Exception:
+    except Exception as exc:
+        logger.debug("doc.Close() 失败，尝试按名关闭: %s", exc)
         try:
             catia.Documents.Item(doc.Name).Close()
-        except Exception:
-            pass
+        except Exception as exc2:
+            logger.debug("按名关闭文档 %s 也失败: %s", getattr(doc, "Name", "?"), exc2)
 
 
 def _convert_step_to_catpart(catia, stp_path: Path) -> tuple[Any, Path]:
@@ -302,7 +316,7 @@ def import_step_to_active_part(
         return status
 
     try:
-        catia = _get_catia()
+        catia = _get_catia(allow_launch=True)
         if catia is None:
             return CatiaStatus(
                 state=CatiaState.NOT_RUNNING,
@@ -413,7 +427,8 @@ def import_step_to_active_part(
                     sel.PasteSpecial(mode)
                     pasted = True
                     break
-                except Exception:
+                except Exception as exc:
+                    logger.debug("PasteSpecial(%s) 失败: %s", mode, exc)
                     continue
 
             if not pasted:
@@ -430,8 +445,8 @@ def import_step_to_active_part(
 
             try:
                 target_part.Update()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("target_part.Update() 失败: %s", exc)
 
         finally:
             if tmp_doc is not None:

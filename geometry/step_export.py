@@ -9,9 +9,12 @@ CATIA receives one coherent body instead of many separate faces.
 from __future__ import annotations
 
 from typing import List
+import logging
 import numpy as np
 
 from models.facet import Facet
+
+logger = logging.getLogger(__name__)
 
 
 def _knots_to_occt(knots: np.ndarray):
@@ -81,7 +84,9 @@ def facet_to_bspline_surface(facet: Facet):
                 poles, u_knots, v_knots, u_mult, v_mult, du, dv
             )
         except Exception as exc:
-            print(f"[step_export] BSpline failed ({facet.index_u},{facet.index_v}): {exc}")
+            logger.warning(
+                "BSpline 曲面构造失败（facet %s,%s）: %s", facet.index_u, facet.index_v, exc
+            )
             return None
 
 
@@ -192,18 +197,26 @@ def facets_to_step(
     from OCP.IFSelect import IFSelect_ReturnStatus
 
     faces = []
+    skipped = 0
     for f in facets:
         if f.is_gap_surface and not include_gap_surfaces:
             continue
         surf = facet_to_bspline_surface(f)
         if surf is None:
+            skipped += 1
             continue
         try:
             mk = BRepBuilderAPI_MakeFace(surf, 1e-6)
             if mk.IsDone():
                 faces.append(mk.Face())
+            else:
+                skipped += 1
+                logger.warning("MakeFace 未完成（facet %s,%s）", f.index_u, f.index_v)
         except Exception as exc:
-            print(f"[step_export] MakeFace failed: {exc}")
+            skipped += 1
+            logger.warning("MakeFace 失败（facet %s,%s）: %s", f.index_u, f.index_v, exc)
+    if skipped:
+        logger.warning("STEP 导出共跳过 %d 个面（曲面/面片构造失败）", skipped)
 
     if not faces:
         raise RuntimeError("No valid NURBS faces to export")

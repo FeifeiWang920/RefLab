@@ -40,10 +40,14 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # Linux/macOS（仅 STL/OBJ 导出可用）
 
-pip install -r requirements.txt
+# 完整安装（界面 + 求解 + STEP 导出 + CATIA 直连）
+pip install -e ".[step,catia]"
+
+# 或最小安装（仅界面 + STL/OBJ 导出）
+pip install -e .
 ```
 
-> `cadquery` 依赖体积较大（含 OpenCascade），仅 STEP 精确导出需要。若只需要 STL/OBJ 网格导出，可先安装 `numpy numba sv-ttk` 运行。
+> `cadquery` 依赖体积较大（含 OpenCascade），仅 STEP 精确导出需要（extras 名 `step`）；`catia` extras 仅在 Windows 上生效。可复现版本锁定见 `constraints.txt`。
 
 ## 快速开始
 
@@ -79,9 +83,15 @@ python main.py
 ## 开发与测试
 
 ```bash
-# 全量测试（引擎特性、UI 冒烟、黄金基线对照）
-.venv\Scripts\python -m pytest tests/ -q
+# 开发安装（含 pytest / ruff）
+pip install -e ".[dev,step,catia]"
+
+# 全量测试（引擎特性、UI 冒烟、黄金基线对照）与静态检查
+pytest -q
+ruff check .
 ```
+
+CI（GitHub Actions）在 Windows 上跑全量、Linux 上跑可跳过子集，每次 push 均执行黄金基线对照。
 
 - `tests/test_engine_features.py`：求解器、缝隙、拟合等引擎特性测试
 - `tests/test_ui.py`：界面冒烟测试（页签、对话框、后台生成、主题字体）

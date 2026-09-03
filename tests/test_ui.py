@@ -76,7 +76,7 @@ def test_visual_theme_and_primary_button():
     assert status_relief in ("", "flat"), f"status bar should be flat, got {status_relief!r}"
 
     import tkinter.font as tkfont
-    from ui.main_window import UI_FONT_FAMILY, UI_FONT_SIZE, SV_TTK_FONTS
+    from ui.main_window import UI_FONT_SIZE, SV_TTK_FONTS
     for name in ("TkDefaultFont", "TkTextFont"):
         f = tkfont.nametofont(name)
         assert f.cget("size") >= UI_FONT_SIZE, (
@@ -99,6 +99,48 @@ def test_visual_theme_and_primary_button():
     root.destroy()
 
 
+def test_parse_deltas_and_aperture_bounds():
+    """UI 纯函数：尺寸列表解析与孔径范围。"""
+    from ui.app_state import parse_deltas
+
+    assert parse_deltas("10,20,30", 4) == [10.0, 20.0, 30.0, 30.0]  # 不足重复末值
+    assert parse_deltas("10; 20", 2) == [10.0, 20.0]  # 分号等价逗号
+    assert parse_deltas("", 2) == [10.0, 10.0]  # 空 → fallback
+    assert parse_deltas("1,2,3,4,5", 2) == [1.0, 2.0]  # 超出截断
+
+    root = tk.Tk()
+    root.withdraw()
+    app = MFReflectorApp(root)
+    root.update_idletasks()
+    # 默认网格：offset ±20、4×10 mm → 孔径 [-20, 20]²
+    assert app._aperture_bounds() == (-20.0, 20.0, -20.0, 20.0)
+    root.destroy()
+
+
+def wait_generation(app, timeout: float = 120.0) -> None:
+    """泵事件循环直到后台生成结束（测试辅助，从生产类移出）。"""
+    import time as _time
+
+    deadline = _time.time() + timeout
+    while app._gen_thread is not None and app._gen_thread.is_alive():
+        if _time.time() >= deadline:
+            raise TimeoutError("generation did not finish in time")
+        try:
+            app.root.update()
+        except tk.TclError:
+            break
+        _time.sleep(0.01)
+    # 再泵几轮让 after 回调把结果与按钮状态落地
+    for _ in range(20):
+        try:
+            app.root.update()
+        except tk.TclError:
+            break
+        if app._gen_thread is None:
+            break
+        _time.sleep(0.01)
+
+
 def test_generate_runs_in_background():
     root = tk.Tk()
     root.withdraw()
@@ -111,13 +153,63 @@ def test_generate_runs_in_background():
     assert str(app.btn_generate.cget("state")) == "disabled"
     assert str(app.btn_catia.cget("state")) == "disabled"
 
-    app._wait_for_generation(timeout=120)
+    wait_generation(app)
     assert app.reflector is not None and app.reflector.is_generated()
     assert app._gen_thread is None
     assert str(app.btn_generate.cget("state")) in ("normal", "")
     assert str(app.btn_catia.cget("state")) in ("normal", "")
     assert "生成" in str(app.status.cget("text"))
 
+    root.destroy()
+
+
+def test_send_catia_runs_in_background(monkeypatch):
+    """发送到 CATIA 必须在工作线程执行，期间按钮禁用，完成后恢复。"""
+    import time as _time
+    from types import SimpleNamespace
+    from catia.bridge import CatiaState, CatiaStatus
+    import ui.main_window as ui_main
+
+    root = tk.Tk()
+    root.withdraw()
+    app = MFReflectorApp(root)
+    root.update_idletasks()
+    app.on_apply()
+    wait_generation(app)
+
+    calls = []
+    monkeypatch.setattr(
+        ui_main, "detect_catia",
+        lambda: CatiaStatus(state=CatiaState.PART_READY, message="mock ready"),
+    )
+
+    def fake_export(*a, **k):
+        _time.sleep(0.15)
+        calls.append("export")
+        return 16
+
+    def fake_import(*a, **k):
+        calls.append("import")
+        return SimpleNamespace(ok=True, message="mock ok")
+
+    monkeypatch.setattr(ui_main, "export_step", fake_export)
+    monkeypatch.setattr(ui_main, "import_step_to_active_part", fake_import)
+
+    app.on_send_catia()
+    assert app._catia_thread is not None and app._catia_thread.is_alive()
+    assert str(app.btn_catia.cget("state")) == "disabled"
+
+    deadline = _time.time() + 30
+    while app._catia_thread is not None and _time.time() < deadline:
+        root.update()
+        _time.sleep(0.01)
+    for _ in range(20):
+        root.update()
+        _time.sleep(0.01)
+
+    assert calls == ["export", "import"]
+    assert "mock ok" in str(app.status.cget("text"))
+    assert str(app.btn_catia.cget("state")) in ("normal", "")
     root.destroy()
 
 

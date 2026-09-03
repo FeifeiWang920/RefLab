@@ -117,7 +117,8 @@ def case_matrix() -> dict:
     }
 
 
-def capture(out_path: Path = GOLDEN_PATH) -> None:
+def capture(out_path: Path = GOLDEN_PATH.with_suffix(".new.npz")) -> None:
+    """捕获当前引擎的高度场到 out_path（默认绝不覆盖黄金基线）。"""
     blobs: dict[str, np.ndarray] = {}
     for name, refl in case_matrix().items():
         x_coords, y_coords, z, _su_g, _sv_g, blocks = _build_height_field(refl)
@@ -130,5 +131,39 @@ def capture(out_path: Path = GOLDEN_PATH) -> None:
     print(f"captured {len(blobs)} arrays -> {out_path}")
 
 
+def compare(baseline_path: Path = GOLDEN_PATH, tol: float = 1e-8) -> int:
+    """当前引擎 vs 指定基线：报告最大偏差，超过 tol 返回 1（可用作脚本门禁）。"""
+    with np.load(baseline_path) as data:
+        golden = {k: data[k] for k in data.files}
+    worst, worst_key = 0.0, ""
+    for name, refl in case_matrix().items():
+        x_coords, y_coords, z, _su_g, _sv_g, blocks = _build_height_field(refl)
+        pairs = [
+            (f"{name}__x", x_coords),
+            (f"{name}__y", y_coords),
+            (f"{name}__z", z),
+        ]
+        pairs += [
+            (f"{name}__b_{iu}_{iv}", blk) for (iu, iv), blk in blocks.items()
+        ]
+        for key, arr in pairs:
+            delta = float(np.max(np.abs(arr - golden[key])))
+            if delta > worst:
+                worst, worst_key = delta, key
+    status = "OK" if worst < tol else "DRIFT"
+    print(f"{status}: max|dz| = {worst:.3e} @ {worst_key} (tol {tol:g})")
+    return 0 if worst < tol else 1
+
+
 if __name__ == "__main__":
-    capture()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="黄金基线工具（两步流，防静默覆盖）")
+    parser.add_argument("action", choices=["capture", "compare"])
+    parser.add_argument("--path", type=Path, default=None, help="capture 的输出 / compare 的基线")
+    args = parser.parse_args()
+    if args.action == "capture":
+        capture(args.path or GOLDEN_PATH.with_suffix(".new.npz"))
+        print("确认无误后，手动替换 golden_height_fields.npz 并提交。")
+    else:
+        raise SystemExit(compare(args.path or GOLDEN_PATH))

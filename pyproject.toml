@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reflab"
+version = "0.9.7"
+description = "RefLab (Reflector Lab) - faceted reflector design: per-facet reflection-law solving, NURBS surfaces, STEP/STL/OBJ export, CATIA bridge"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Zifei" }]
+keywords = ["optics", "reflector", "illumination", "facets", "nurbs", "cad", "step", "catia"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Manufacturing",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+# 运行核心（界面 + 逐面片求解 + STL/OBJ 导出）
+dependencies = [
+    "numpy>=1.24.0",
+    "numba>=0.59.0",
+    "sv-ttk>=2.6.0",
+]
+
+[project.optional-dependencies]
+# 精确 STEP 导出（OpenCascade，体积较大）
+step = ["cadquery>=2.4.0"]
+# CATIA V5 COM 直连（仅 Windows）
+catia = ["pywin32>=300; sys_platform == 'win32'"]
+# 开发/测试
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.scripts]
+reflab = "main:main"
+
+[tool.setuptools]
+# 平面布局：顶层包 + 入口模块（src/ 迁移属 M2 范畴）
+packages = ["models", "geometry", "ui", "catia"]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 200
+target-version = "py39"
+
+[tool.ruff.lint]
+# 宽松起步：pyflakes 全开 + pycodestyle，行宽由 line-length 放宽
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 平面布局下 sys.path 引导必须先于导入，E402 属有意为之
+"main.py" = ["E402"]
+"ui/main_window.py" = ["E402"]
+"geometry/__init__.py" = ["E402"]
+"tests/*" = ["E402", "F403", "F405"]
+# engine 中的 `I` 是入射向量物理符号；F841 是待 M2 死代码清理的既有赋值
+"geometry/engine.py" = ["E741", "F841"]
+"geometry/mathutils.py" = ["E741"]
+"geometry/solve.py" = ["E741", "F841"]
+"tests/diag_reflector.py" = ["E741"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+# 宽松起步：先看报告，不作为 CI 门禁
+exclude = ["\\.venv", "tests/output"]

@@ -1,612 +1,44 @@
 # SPDX-License-Identifier: MIT
 """
-MacroFocal geometry engine (v0.8 – per-facet solver + Gap Surface).
+RefLab geometry engine —— 逐面片求解流水线编排（门面模块）。
 
-1. Carrier paraboloid + relative slope integration, solved facet by facet.
-2. Each facet is fitted with a real B-spline (NURBS) surface.
-3. GapSurfaceMode.SURFACE generates ruled patches between adjacent facets.
+求解原语分布在 geometry.mathutils / flux / reconstruction / solve / facets /
+parallel；本模块只保留：全局求解顺序（F.Start / BFS）、五个求解阶段
+（Pass 1 绝对求解、Pass 2 仿射校准、逆问题迭代、抛光、Pass 3 邻边缝合）
+与 `_build_height_field`。`generate_facets` 的实现在 geometry.facets，
+此处提供门面转发（延迟导入避免循环依赖）。
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
-from concurrent.futures import ThreadPoolExecutor
-import os
+from geometry.parallel import _parallel_map
+from geometry.mathutils import _carrier_z
+from geometry.flux import _energy_fracs, _incident_flux_weights, _linear_fracs, _source_emission_axis
+from geometry.solve import (  # noqa: F401 – 部分为测试兼容 re-export
+    _apply_affine,
+    _calibrate_facets,
+    _eval_facet,
+    _polish_farfield_rectangle,
+    _realized_angles_on_block,
+    _separable_inverse_target,
+    _solve_facet_optical,
+    _solve_facet_with_borders,
+    _spatial_intensity_inverse,
+    _target_fn_from_fracs,
+)
+
+from typing import Dict, List, NamedTuple, Tuple
+import logging
 import numpy as np
 
 from models.reflector import MFReflector
+from models.grid import GridLayout
 from models.facet import Facet
-from models.enums import (
-    EdgeRayMode,
-    GapSurfaceMode,
-    GapType,
-    PatchContinuity,
-    PatchFitMethod,
-    SolveMethod,
-)
-from geometry.nurbs import make_nurbs_from_grid
+from models.enums import LightTargetType, SolveMethod
+from geometry import tuning
 
+logger = logging.getLogger(__name__)
 
-def _facet_worker_count(n_tasks: int) -> int:
-    """Independent facet solves share a pool; LAPACK / NumPy release the GIL."""
-    if n_tasks <= 1:
-        return 1
-    env = os.environ.get("MF_REFLECTOR_JOBS", "").strip()
-    if env:
-        try:
-            return max(1, min(n_tasks, int(env)))
-        except ValueError:
-            pass
-    return max(1, min(n_tasks, os.cpu_count() or 1))
-
-
-def _parallel_map(fn, items):
-    items = list(items)
-    workers = _facet_worker_count(len(items))
-    if workers <= 1:
-        return [fn(item) for item in items]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(fn, items))
-
-
-def _unit(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v)
-    return v / n if n > 1e-12 else np.array([0.0, 0.0, 1.0])
-
-
-def _unit_nd(v: np.ndarray) -> np.ndarray:
-    """Row-wise unit vectors; zero rows become +Z (same as `_unit`)."""
-    v = np.asarray(v, dtype=float)
-    n = np.linalg.norm(v, axis=-1, keepdims=True)
-    zaxis = np.zeros_like(v)
-    zaxis[..., 2] = 1.0
-    return np.where(n > 1e-12, v / np.maximum(n, 1e-30), zaxis)
-
-
-def _target_direction(h_min, h_max, v_min, v_max, edge_ray: EdgeRayMode) -> np.ndarray:
-    if edge_ray == EdgeRayMode.MAX:
-        h, v = np.deg2rad(h_max), np.deg2rad(v_max)
-    elif edge_ray == EdgeRayMode.MIN:
-        h, v = np.deg2rad(h_min), np.deg2rad(v_min)
-    else:
-        h = np.deg2rad(0.5 * (h_min + h_max))
-        v = np.deg2rad(0.5 * (v_min + v_max))
-    d = np.array([np.sin(h) * np.cos(v), np.sin(v), np.cos(h) * np.cos(v)])
-    return _unit(d)
-
-
-def _target_direction_from_angles(h_deg, v_deg) -> np.ndarray:
-    h = np.deg2rad(np.asarray(h_deg, dtype=float))
-    v = np.deg2rad(np.asarray(v_deg, dtype=float))
-    d = np.stack(
-        [np.sin(h) * np.cos(v), np.sin(v), np.cos(h) * np.cos(v)],
-        axis=-1,
-    )
-    return _unit_nd(d)
-
-
-def _required_normal(source, point, target) -> np.ndarray:
-    N = _required_normals(source, np.asarray(point, dtype=float), np.asarray(target, dtype=float))
-    return N if N.ndim == 1 else N.reshape(3)
-
-
-def _required_normals(source, points, targets) -> np.ndarray:
-    source = np.asarray(source, dtype=float).reshape(3)
-    points = np.asarray(points, dtype=float)
-    targets = np.asarray(targets, dtype=float)
-    I = _unit_nd(points - source)
-    R = _unit_nd(targets)
-    N = R - I
-    nrm = np.linalg.norm(N, axis=-1, keepdims=True)
-    N = np.where(nrm < 1e-9, -I, N / np.maximum(nrm, 1e-30))
-    toward = np.sum(N * (source - points), axis=-1, keepdims=True)
-    return np.where(toward < 0.0, -N, N)
-
-
-def _slopes_from_normal(N: np.ndarray) -> Tuple[float, float]:
-    if abs(N[2]) < 1e-9:
-        return 0.0, 0.0
-    return -float(N[0] / N[2]), -float(N[1] / N[2])
-
-
-def _slopes_from_normals(N: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    nz = N[..., 2]
-    safe = np.abs(nz) >= 1e-9
-    dzx = np.zeros(N.shape[:-1], dtype=float)
-    dzy = np.zeros(N.shape[:-1], dtype=float)
-    dzx = np.where(safe, -N[..., 0] / np.where(safe, nz, 1.0), 0.0)
-    dzy = np.where(safe, -N[..., 1] / np.where(safe, nz, 1.0), 0.0)
-    return dzx, dzy
-
-
-def _eval_target_grid(target_fn, su: int, sv: int) -> Tuple[np.ndarray, np.ndarray]:
-    """target_fn(li, lj) does not depend on height — evaluate once per solve.
-
-    target_fn 要么支持整网格数组输入（向量化路径），要么退回逐节点循环。
-    形状校验保证错误形状的返回值不会被误用。
-    """
-    LI, LJ = np.meshgrid(np.arange(su), np.arange(sv))  # (sv, su)
-    try:
-        hs, vs = target_fn(LI, LJ)
-        hs = np.asarray(hs, dtype=float)
-        vs = np.asarray(vs, dtype=float)
-        if hs.shape == (sv, su) and vs.shape == (sv, su):
-            return hs, vs
-    except (TypeError, ValueError, IndexError):
-        pass
-    hs = np.empty((sv, su), dtype=float)
-    vs = np.empty((sv, su), dtype=float)
-    for lj in range(sv):
-        for li in range(su):
-            hs[lj, li], vs[lj, li] = target_fn(li, lj)
-    return hs, vs
-
-
-def _slopes_on_surface(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    z: np.ndarray,
-    source: np.ndarray,
-    h_deg: np.ndarray,
-    v_deg: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    xx, yy = np.meshgrid(xs, ys)
-    targets = _target_direction_from_angles(h_deg, v_deg)
-    pts = np.stack((xx, yy, z), axis=-1)
-    return _slopes_from_normals(_required_normals(source, pts, targets))
-
-
-def _slopes_on_surface_static(
-    xx: np.ndarray,
-    yy: np.ndarray,
-    z: np.ndarray,
-    source: np.ndarray,
-    targets: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """`_slopes_on_surface` with the grid mesh and target directions hoisted
-    out of the caller's iteration loop (only z changes per iteration)."""
-    pts = np.stack((xx, yy, z), axis=-1)
-    return _slopes_from_normals(_required_normals(source, pts, targets))
-
-
-def _height_slopes(xs: np.ndarray, ys: np.ndarray, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Node-centered finite-difference slopes of a height block."""
-    z = np.asarray(z, dtype=float)
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    sv, su = z.shape
-    zx = np.zeros((sv, su), dtype=float)
-    zy = np.zeros((sv, su), dtype=float)
-    if su >= 2:
-        zx[:, 0] = (z[:, 1] - z[:, 0]) / (xs[1] - xs[0])
-        zx[:, -1] = (z[:, -1] - z[:, -2]) / (xs[-1] - xs[-2])
-    if su >= 3:
-        zx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / (xs[2:] - xs[:-2])
-    if sv >= 2:
-        zy[0, :] = (z[1, :] - z[0, :]) / (ys[1] - ys[0])
-        zy[-1, :] = (z[-1, :] - z[-2, :]) / (ys[-1] - ys[-2])
-    if sv >= 3:
-        zy[1:-1, :] = (z[2:, :] - z[:-2, :]) / (ys[2:] - ys[:-2])[:, None]
-    return zx, zy
-
-
-def _node_half_widths(coords: np.ndarray) -> np.ndarray:
-    coords = np.asarray(coords, dtype=float)
-    n = coords.size
-    half = np.ones(n, dtype=float)
-    if n <= 1:
-        return half
-    half[0] = 0.5 * abs(coords[1] - coords[0])
-    half[-1] = 0.5 * abs(coords[-1] - coords[-2])
-    if n >= 3:
-        half[1:-1] = 0.5 * np.abs(coords[2:] - coords[:-2])
-    return np.maximum(half, 1e-12)
-
-
-def _source_emission_axis(reflector: MFReflector) -> np.ndarray:
-    """
-    Source emission axis.  Explicit `source.axis` wins; otherwise the axis
-    points from the source to the carrier-surface centre of the aperture.
-    """
-    src = reflector.source
-    if getattr(src, "axis", None) is not None:
-        axis = np.asarray(src.axis, dtype=float).reshape(3)
-        n = float(np.linalg.norm(axis))
-        if n > 1e-12:
-            return axis / n
-    pos = np.asarray(src.position, dtype=float).reshape(3)
-    grid = reflector.grid
-    cx = float(grid.offset_x + 0.5 * grid.total_width)
-    cy = float(grid.offset_y + 0.5 * grid.total_height)
-    cz = float(_carrier_z(cx, cy, pos, grid.focal))
-    delta = np.array([cx, cy, cz]) - pos
-    n = float(np.linalg.norm(delta))
-    if n < 1e-12:
-        return np.array([0.0, 0.0, -1.0])
-    return delta / n
-
-
-def _incident_flux_weights(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    z: np.ndarray,
-    source: np.ndarray,
-    axis: Optional[np.ndarray] = None,
-    pattern: str = "lambertian",
-    lambert_n: float = 1.0,
-) -> np.ndarray:
-    """
-    Incident flux at each height-field node.
-
-    dΦ = I(θ_s) · cosθ_i / r² · dA
-
-      r      source → surface distance
-      θ_s    emission angle from the source axis
-      θ_i    incidence angle on the reflector
-      I(θ_s) 1                     if pattern == "isotropic"
-             max(0, cos θ_s)^n     if pattern == "lambertian"
-    """
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    z = np.asarray(z, dtype=float)
-    source = np.asarray(source, dtype=float).reshape(3)
-    xx, yy = np.meshgrid(xs, ys)
-    pts = np.stack((xx, yy, z), axis=-1)
-    emit = pts - source
-    dist = np.linalg.norm(emit, axis=-1, keepdims=True)
-    dist = np.maximum(dist, 1e-9)
-    emit_hat = emit / dist
-    if axis is None:
-        centre = pts.reshape(-1, 3).mean(axis=0)
-        axis_vec = centre - source
-        an = float(np.linalg.norm(axis_vec))
-        axis_vec = axis_vec / an if an > 1e-12 else np.array([0.0, 0.0, -1.0])
-    else:
-        axis_vec = _unit(np.asarray(axis, dtype=float).reshape(3))
-    zx, zy = _height_slopes(xs, ys, z)
-    nrm = np.stack((-zx, -zy, np.ones(z.shape, dtype=float)), axis=-1)
-    nrm = _unit_nd(nrm)
-    cos_i = np.maximum(np.sum(nrm * (-emit_hat), axis=-1), 0.0)
-    cos_s = np.maximum(np.sum(emit_hat * axis_vec.reshape(1, 1, 3), axis=-1), 0.0)
-    if str(pattern).lower() == "isotropic":
-        intensity = np.ones_like(cos_s)
-    else:
-        intensity = np.power(cos_s, max(0.0, float(lambert_n)))
-    dA = (
-        _node_half_widths(ys)[:, None]
-        * _node_half_widths(xs)[None, :]
-        * np.sqrt(1.0 + zx * zx + zy * zy)
-    )
-    return intensity * cos_i / np.square(dist[..., 0]) * dA
-
-
-def _cdf_from_weights(weights: np.ndarray) -> np.ndarray:
-    """Monotone CDF at sample nodes from interval-integrated 1-D weights."""
-    w = np.maximum(np.asarray(weights, dtype=float).ravel(), 0.0)
-    n = w.size
-    if n <= 1:
-        return np.zeros(n, dtype=float)
-    mid = 0.5 * (w[:-1] + w[1:])
-    total = float(np.sum(mid))
-    if total <= 1e-30:
-        return np.linspace(0.0, 1.0, n)
-    cdf = np.concatenate(([0.0], np.cumsum(mid)))
-    return cdf / cdf[-1]
-
-
-def _energy_fracs(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    z: np.ndarray,
-    source: np.ndarray,
-    axis: Optional[np.ndarray] = None,
-    pattern: str = "lambertian",
-    lambert_n: float = 1.0,
-    gamma: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Separable 1-D energy parameters (frac_u, frac_v) ∈ [0, 1].
-
-    gamma is applied to the *flux*, then the CDF is taken:
-      w' = w^γ,  frac = CDF(w').
-    γ = 1 is étendue-correct.  γ > 1 over-weights the peak so the
-    integrable projection has more angle span to give back.  Powering
-    the CDF itself would skew left/right and is not used.
-    """
-    flux = _incident_flux_weights(
-        xs, ys, z, source, axis=axis, pattern=pattern, lambert_n=lambert_n
-    )
-    g = float(np.clip(gamma, 0.8, 2.0))
-    if abs(g - 1.0) > 1e-6:
-        flux = np.power(np.maximum(flux, 0.0), g)
-    col = flux.sum(axis=0)
-    row = flux.sum(axis=1)
-    # Separable dΩ ~ (dH/du)(dV/dv) collapses at corners (both CDFs
-    # flat).  Floor the 1-D weights so edge/corner bins keep ~10% of
-    # peak angle speed and do not pile into two hot corners.
-    for arr in (col, row):
-        peak = float(np.max(arr))
-        if peak > 0.0:
-            arr[:] = np.maximum(arr, 0.1 * peak)
-    return _cdf_from_weights(col), _cdf_from_weights(row)
-
-
-def _energy_fracs_2d(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    z: np.ndarray,
-    source: np.ndarray,
-    axis: Optional[np.ndarray] = None,
-    pattern: str = "lambertian",
-    lambert_n: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    2-D energy parameters on the facet grid.
-
-    Average of the two nested-CDF orders so a non-separable Lambertian
-    irradiance (offset source) is redistributed in both H and V.
-    """
-    flux = _incident_flux_weights(
-        xs, ys, z, source, axis=axis, pattern=pattern, lambert_n=lambert_n
-    )
-    sv, su = flux.shape
-    fu_col = _cdf_from_weights(flux.sum(axis=0))
-    fv_given_u = np.column_stack([_cdf_from_weights(flux[:, i]) for i in range(su)])
-    fu_a = np.broadcast_to(fu_col[None, :], (sv, su)).copy()
-    fv_row = _cdf_from_weights(flux.sum(axis=1))
-    fu_given_v = np.vstack([_cdf_from_weights(flux[j, :]) for j in range(sv)])
-    fv_b = np.broadcast_to(fv_row[:, None], (sv, su)).copy()
-    return 0.5 * (fu_a + fu_given_v), 0.5 * (fv_given_u + fv_b)
-
-
-def _linear_fracs(su: int, sv: int) -> Tuple[np.ndarray, np.ndarray]:
-    return (
-        np.linspace(0.0, 1.0, max(su, 1)),
-        np.linspace(0.0, 1.0, max(sv, 1)),
-    )
-
-
-def _frac_at(frac: np.ndarray, li: int, lj: int) -> float:
-    fu = np.asarray(frac, dtype=float)
-    if fu.ndim == 2:
-        j = int(np.clip(lj, 0, fu.shape[0] - 1))
-        i = int(np.clip(li, 0, fu.shape[1] - 1))
-        return float(fu[j, i])
-    return float(fu[int(np.clip(li if fu.size == fu.shape[-1] else lj, 0, fu.size - 1))])
-
-
-def _target_fn_from_fracs(spreads, iu: int, iv: int, frac_u: np.ndarray, frac_v: np.ndarray):
-    fu = np.asarray(frac_u, dtype=float)
-    fv = np.asarray(frac_v, dtype=float)
-
-    def fn(li, lj, fu=fu, fv=fv, iu=iu, iv=iv):
-        array_input = np.ndim(li) > 0 or np.ndim(lj) > 0
-        if fu.ndim == 2:
-            j = np.clip(lj, 0, fu.shape[0] - 1)
-            i = np.clip(li, 0, fu.shape[1] - 1)
-            if array_input:
-                return spreads.target_angles_on_facet_grid(
-                    iu, iv, fu[j.astype(int), i.astype(int)],
-                    fv[j.astype(int), i.astype(int)],
-                )
-            return spreads.target_angles_on_facet(
-                iu, iv, float(fu[int(j), int(i)]), float(fv[int(j), int(i)])
-            )
-        i = np.clip(li, 0, fu.size - 1).astype(int)
-        j = np.clip(lj, 0, fv.size - 1).astype(int)
-        if array_input:
-            return spreads.target_angles_on_facet_grid(iu, iv, fu[i], fv[j])
-        return spreads.target_angles_on_facet(iu, iv, float(fu[int(i)]), float(fv[int(j)]))
-
-    return fn
-
-
-def _apply_affine(h: float, v: float, a1: float, b1: float, a2: float, b2: float) -> Tuple[float, float]:
-    if abs(b1) < 1e-6:
-        b1 = 1.0
-    if abs(b2) < 1e-6:
-        b2 = 1.0
-    return (h - a1) / b1, (v - a2) / b2
-
-
-def _planar_inverse_target(
-    tgt_h: np.ndarray,
-    tgt_v: np.ndarray,
-    real_h: np.ndarray,
-    real_v: np.ndarray,
-    gain: float = 1.0,
-):
-    """
-    2-D residual inverse: ask for the energy-mapped target plus the
-    (target − realised) error so an integrable projection cannot pile
-    flux into the mean angle (hot centre).
-    """
-    tgt_h = np.asarray(tgt_h, dtype=float)
-    tgt_v = np.asarray(tgt_v, dtype=float)
-    asked_h = tgt_h + float(gain) * (tgt_h - np.asarray(real_h, dtype=float))
-    asked_v = tgt_v + float(gain) * (tgt_v - np.asarray(real_v, dtype=float))
-    h_lo, h_hi = float(np.min(tgt_h)), float(np.max(tgt_h))
-    v_lo, v_hi = float(np.min(tgt_v)), float(np.max(tgt_v))
-    asked_h = np.clip(asked_h, h_lo, h_hi)
-    asked_v = np.clip(asked_v, v_lo, v_hi)
-    # Keep the rectangular outline: blend only the border back to target.
-    asked_h[:, 0] = 0.20 * asked_h[:, 0] + 0.80 * tgt_h[:, 0]
-    asked_h[:, -1] = 0.20 * asked_h[:, -1] + 0.80 * tgt_h[:, -1]
-    asked_v[0, :] = 0.20 * asked_v[0, :] + 0.80 * tgt_v[0, :]
-    asked_v[-1, :] = 0.20 * asked_v[-1, :] + 0.80 * tgt_v[-1, :]
-    sv, su = asked_h.shape
-    if su >= 3 and sv >= 3:
-        kernel_h = (
-            4.0 * asked_h[1:-1, 1:-1]
-            + asked_h[1:-1, :-2] + asked_h[1:-1, 2:]
-            + asked_h[:-2, 1:-1] + asked_h[2:, 1:-1]
-        ) / 8.0
-        kernel_v = (
-            4.0 * asked_v[1:-1, 1:-1]
-            + asked_v[1:-1, :-2] + asked_v[1:-1, 2:]
-            + asked_v[:-2, 1:-1] + asked_v[2:, 1:-1]
-        ) / 8.0
-        asked_h[1:-1, 1:-1] = kernel_h
-        asked_v[1:-1, 1:-1] = kernel_v
-
-    def fn(li: int, lj: int, ah=asked_h, av=asked_v) -> Tuple[float, float]:
-        j = int(np.clip(lj, 0, av.shape[0] - 1))
-        i = int(np.clip(li, 0, ah.shape[1] - 1))
-        return float(ah[j, i]), float(av[j, i])
-
-    return fn
-
-
-def _carrier_z(x, y, source, focal) -> float:
-    sx, sy, sz = source
-    rho2 = (x - sx) ** 2 + (y - sy) ** 2
-    return (sz - focal) + rho2 / (4.0 * focal)
-
-
-def _carrier_normal(x, y, source, focal) -> np.ndarray:
-    sx, sy, _ = source
-    zx = (x - sx) / (2.0 * focal)
-    zy = (y - sy) / (2.0 * focal)
-    return _unit(np.array([-zx, -zy, 1.0]))
-
-
-def _integrate_relative(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_carrier: np.ndarray,
-    order: SolveMethod,
-    start_i: int = -1,
-    start_j: int = -1,
-) -> np.ndarray:
-    nv, nu = dzx.shape
-    z_rel = np.zeros((nv, nu), dtype=float)
-    ci = max(0, min(nu - 1, start_i if start_i >= 0 else nu // 2))
-    cj = max(0, min(nv - 1, start_j if start_j >= 0 else nv // 2))
-
-    if order == SolveMethod.V_FIRST:
-        for j in range(cj + 1, nv):
-            dy = y_coords[j] - y_coords[j - 1]
-            z_rel[j, ci] = z_rel[j - 1, ci] + 0.5 * (dzy[j, ci] + dzy[j - 1, ci]) * dy
-        for j in range(cj - 1, -1, -1):
-            dy = y_coords[j] - y_coords[j + 1]
-            z_rel[j, ci] = z_rel[j + 1, ci] + 0.5 * (dzy[j, ci] + dzy[j + 1, ci]) * dy
-        for j in range(nv):
-            for i in range(ci + 1, nu):
-                dx = x_coords[i] - x_coords[i - 1]
-                z_rel[j, i] = z_rel[j, i - 1] + 0.5 * (dzx[j, i] + dzx[j, i - 1]) * dx
-            for i in range(ci - 1, -1, -1):
-                dx = x_coords[i] - x_coords[i + 1]
-                z_rel[j, i] = z_rel[j, i + 1] + 0.5 * (dzx[j, i] + dzx[j, i + 1]) * dx
-    else:
-        for i in range(ci + 1, nu):
-            dx = x_coords[i] - x_coords[i - 1]
-            z_rel[cj, i] = z_rel[cj, i - 1] + 0.5 * (dzx[cj, i] + dzx[cj, i - 1]) * dx
-        for i in range(ci - 1, -1, -1):
-            dx = x_coords[i] - x_coords[i + 1]
-            z_rel[cj, i] = z_rel[cj, i + 1] + 0.5 * (dzx[cj, i] + dzx[cj, i + 1]) * dx
-        for i in range(nu):
-            for j in range(cj + 1, nv):
-                dy = y_coords[j] - y_coords[j - 1]
-                z_rel[j, i] = z_rel[j - 1, i] + 0.5 * (dzy[j, i] + dzy[j - 1, i]) * dy
-            for j in range(cj - 1, -1, -1):
-                dy = y_coords[j] - y_coords[j + 1]
-                z_rel[j, i] = z_rel[j + 1, i] + 0.5 * (dzy[j, i] + dzy[j + 1, i]) * dy
-    return z_carrier + z_rel
-
-
-def _reconstruct_height_by_paths(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-    order: SolveMethod,
-) -> np.ndarray:
-    """
-    LucidShape-style relative (here: absolute) slope integration.
-
-    Least-squares projection of a non-conservative reflection-law slope
-    field damps |∇z| and packs rays toward the mean angle (hot centre).
-    Path integration along the FunGeo solve order keeps the designed
-    H(u)/V(v) sweep, which is what FFD uses to fill the rectangle.
-    """
-    base = np.full(np.asarray(dzx).shape, float(z_seed))
-    return _integrate_relative(
-        dzx, dzy, x_coords, y_coords, base, order,
-        start_i=seed_i, start_j=seed_j,
-    )
-
-
-def _match_border_slopes(
-    z: np.ndarray,
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-) -> np.ndarray:
-    """
-    Pull the four graph edges onto the designed normal slopes.
-
-    Single-path integration only uses zy on the seed column and zx on
-    each row.  Finite-difference zy on the top/bottom edges then becomes
-    a side-effect of the neighbouring row, so realised V drifts with x
-    and the far-field bottom edge smiles.  Reset the border nodes from
-    the *desired* perpendicular slope; corners are the average of the
-    two edge predictions.
-    """
-    z = np.asarray(z, dtype=float).copy()
-    dzx = np.asarray(dzx, dtype=float)
-    dzy = np.asarray(dzy, dtype=float)
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    nv, nu = z.shape
-    if nv < 2 or nu < 2:
-        return z
-    pred = np.zeros((nv, nu), dtype=float)
-    hit = np.zeros((nv, nu), dtype=float)
-
-    dy0 = ys[1] - ys[0]
-    pred[0, :] += z[1, :] - 0.5 * (dzy[0, :] + dzy[1, :]) * dy0
-    hit[0, :] += 1.0
-    dy1 = ys[-1] - ys[-2]
-    pred[-1, :] += z[-2, :] + 0.5 * (dzy[-2, :] + dzy[-1, :]) * dy1
-    hit[-1, :] += 1.0
-
-    dx0 = xs[1] - xs[0]
-    pred[:, 0] += z[:, 1] - 0.5 * (dzx[:, 0] + dzx[:, 1]) * dx0
-    hit[:, 0] += 1.0
-    dx1 = xs[-1] - xs[-2]
-    pred[:, -1] += z[:, -2] + 0.5 * (dzx[:, -2] + dzx[:, -1]) * dx1
-    hit[:, -1] += 1.0
-
-    mask = hit > 0
-    z[mask] = pred[mask] / hit[mask]
-    return z
-
-
-def _reconstruct_height_ffd(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-    order: SolveMethod,
-) -> np.ndarray:
-    """Path integration (FFD sweep) plus border-slope lock (rectangle)."""
-    z = _reconstruct_height_by_paths(
-        dzx, dzy, x_coords, y_coords, z_seed, seed_i, seed_j, order
-    )
-    z = _match_border_slopes(z, dzx, dzy, x_coords, y_coords)
-    seed_i = int(np.clip(seed_i, 0, z.shape[1] - 1))
-    seed_j = int(np.clip(seed_j, 0, z.shape[0] - 1))
-    z += float(z_seed) - float(z[seed_j, seed_i])
-    return z
 
 def _solve_order(n_u: int, n_v: int, start: Tuple[int, int], order: SolveMethod) -> Tuple[
     List[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]]
@@ -669,218 +101,357 @@ def _start_facet(reflector: MFReflector) -> Tuple[int, int, float, float]:
     return iu, iv, float(np.clip(local_u, 0.0, 1.0)), float(np.clip(local_v, 0.0, 1.0))
 
 
-def _inherit_edge(
-    raw: np.ndarray,
-    neighbor: np.ndarray,
-    axis: str,
-    ref: float,
-    use_curve: bool,
-) -> np.ndarray:
-    if axis == "v":
-        delta = neighbor[-1, :] - raw[0, :]
-        if not use_curve:
-            index = int(round(np.clip(ref, 0.0, 1.0) * (delta.shape[0] - 1)))
-            delta[:] = delta[index]
-        weights = np.linspace(0.0, 1.0, raw.shape[0])[:, None]
-        return raw + delta[None, :] * weights
-    delta = neighbor[:, -1] - raw[:, 0]
-    if not use_curve:
-        index = int(round(np.clip(ref, 0.0, 1.0) * (delta.shape[0] - 1)))
-        delta[:] = delta[index]
-    weights = np.linspace(0.0, 1.0, raw.shape[1])[None, :]
-    return raw + delta[:, None] * weights
+class HeightField(NamedTuple):
+    """`_build_height_field` 的结果：全局坐标、拼装高度场与逐面片块。"""
+
+    x_coords: np.ndarray
+    y_coords: np.ndarray
+    z: np.ndarray
+    su: int
+    sv: int
+    blocks: Dict[Tuple[int, int], np.ndarray]
 
 
+class _GridCtx(NamedTuple):
+    """一次流水线共享的逐面片几何数据（子网格/种子/载体高度）。"""
 
-def _fair_height_block(z: np.ndarray, iterations: int = 12, strength: float = 0.4) -> np.ndarray:
-    """Laplacian fairing; boundaries fixed."""
-    if z.shape[0] < 3 or z.shape[1] < 3 or iterations <= 0:
-        return z
-    out = z.astype(float, copy=True)
-    for _ in range(iterations):
-        lap = (
-            out[:-2, 1:-1] + out[2:, 1:-1] + out[1:-1, :-2] + out[1:-1, 2:]
-            - 4.0 * out[1:-1, 1:-1]
-        )
-        out[1:-1, 1:-1] += strength * 0.25 * lap
-    return out
-
-
-def _reconstruct_height_separable(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-) -> np.ndarray:
-    """
-    Integrable graph z = z_seed + F(x) + G(y).
-
-    Crossed-rays-off FFD: zx depends only on x, zy only on y, so every
-    column has the same V travel and the bottom iso-V stays level.
-    Target slopes are averaged to a conservative separable field, then
-    integrated from the seed.  No LS projection, no 2-D angle warp.
-    """
-    dzx = np.asarray(dzx, dtype=float)
-    dzy = np.asarray(dzy, dtype=float)
-    xs = np.asarray(x_coords, dtype=float)
-    ys = np.asarray(y_coords, dtype=float)
-    nv, nu = dzx.shape
-    seed_i = int(np.clip(seed_i, 0, nu - 1))
-    seed_j = int(np.clip(seed_j, 0, nv - 1))
-    fx = dzx.mean(axis=0)
-    gy = dzy.mean(axis=1)
-    F = np.zeros(nu, dtype=float)
-    G = np.zeros(nv, dtype=float)
-    for i in range(seed_i + 1, nu):
-        F[i] = F[i - 1] + 0.5 * (fx[i] + fx[i - 1]) * (xs[i] - xs[i - 1])
-    for i in range(seed_i - 1, -1, -1):
-        F[i] = F[i + 1] + 0.5 * (fx[i] + fx[i + 1]) * (xs[i] - xs[i + 1])
-    for j in range(seed_j + 1, nv):
-        G[j] = G[j - 1] + 0.5 * (gy[j] + gy[j - 1]) * (ys[j] - ys[j - 1])
-    for j in range(seed_j - 1, -1, -1):
-        G[j] = G[j + 1] + 0.5 * (gy[j] + gy[j + 1]) * (ys[j] - ys[j + 1])
-    return float(z_seed) + F[None, :] + G[:, None]
+    su: int
+    sv: int
+    n_u: int
+    n_v: int
+    solve_order: List[Tuple[int, int]]
+    parents: Dict[Tuple[int, int], Tuple[int, int]]
+    facet_grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]
+    facet_seeds: Dict[Tuple[int, int], Tuple[int, int, float]]
+    carriers: Dict[Tuple[int, int], np.ndarray]
 
 
-class _SlopeHeightSolver:
-    """Pre-factorised least-squares height reconstruction for one facet grid.
+class _EnergyCtx(NamedTuple):
+    """能量映射上下文（均匀光强模式使用）。"""
 
-    The weighted design matrix depends only on the grid geometry
-    (xs, ys, edge_weight, seed) — never on the slopes — so the linear map
-    from slope fields to heights is factorised once and every subsequent
-    solve reduces to building the right-hand side plus one matvec.
-    Degenerate grids (rank-deficient normal equations) fall back to the
-    SVD lstsq path, matching the historical behaviour.
-    """
+    use_energy: bool
+    kw: Dict[str, object]
+    gamma: float
 
-    def __init__(
-        self,
-        x_coords: Sequence[float],
-        y_coords: Sequence[float],
-        z_seed: float,
-        seed_i: int,
-        seed_j: int,
-        edge_weight: float = 2.5,
-    ) -> None:
-        xs = np.asarray(x_coords, dtype=float)
-        ys = np.asarray(y_coords, dtype=float)
-        nv = int(ys.size)
-        nu = int(xs.size)
-        N = nv * nu
-        self.nv, self.nu, self.N = nv, nu, N
 
-        n_eq = nv * (nu - 1) + (nv - 1) * nu
-        A = np.zeros((n_eq, N))
-        w = np.ones(n_eq)
-        # Interval slope = average of the two node slopes (trapezoid rule).
-        # Using only the left/bottom node systematically under-steers the
-        # surface and packs rays toward the mean angle (hot centre + soft edge).
-        # Boundary intervals get a higher weight so the rectangular far-field
-        # outline is honoured even when the slope field is not conservative.
-        edge_w = float(edge_weight) if edge_weight is not None else 2.5
-        dx = np.diff(xs)
-        dy = np.diff(ys)
-        # 行序与历史实现一致：先全部 x 行（j 外层、i 内层，跳过 dx<=0），后 y 行。
-        x_ok = dx > 0.0
-        y_ok = dy > 0.0
-        k = 0
-        for j in range(nv):
-            wrow = edge_w if (j == 0 or j == nv - 1) else 1.0
-            for i in range(nu - 1):
-                if not x_ok[i]:
-                    continue
-                A[k, j * nu + i + 1] = 1.0 / dx[i]
-                A[k, j * nu + i] = -1.0 / dx[i]
-                w[k] = wrow * (edge_w if (i == 0 or i == nu - 2) else 1.0)
-                k += 1
-        for j in range(nv - 1):
-            for i in range(nu):
-                if not y_ok[j]:
-                    continue
-                A[k, (j + 1) * nu + i] = 1.0 / dy[j]
-                A[k, j * nu + i] = -1.0 / dy[j]
-                wcol = edge_w if (i == 0 or i == nu - 1) else 1.0
-                w[k] = wcol * (edge_w if (j == 0 or j == nv - 2) else 1.0)
-                k += 1
-        A = A[:k]
-        w = w[:k]
-        sw = np.sqrt(w)
-        A = A * sw[:, None]
+def _subgrid_coords(
+    grid: GridLayout, su: int, sv: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """全局逐节点子网格坐标（相邻面片共享边界列）。"""
+    x_edges = grid.node_x_coords()
+    y_edges = grid.node_y_coords()
+    x_list: List[float] = []
+    for iu in range(grid.n_u):
+        for k in range(su - 1):
+            t = k / (su - 1)
+            x_list.append((1.0 - t) * x_edges[iu] + t * x_edges[iu + 1])
+    x_list.append(x_edges[-1])
+    y_list: List[float] = []
+    for iv in range(grid.n_v):
+        for k in range(sv - 1):
+            t = k / (sv - 1)
+            y_list.append((1.0 - t) * y_edges[iv] + t * y_edges[iv + 1])
+    y_list.append(y_edges[-1])
+    return np.asarray(x_list, dtype=float), np.asarray(y_list, dtype=float)
 
-        # 行选择索引：把 (dzx, dzy) 展平后的 b 直接映射到保留的方程行。
-        # True 的个数恰为 k（保留的方程行数），与 A 的行序一致。
-        self._sel = np.concatenate((
-            np.tile(x_ok, nv),
-            np.repeat(y_ok, nu),
-        ))
-        self._sw_sel = sw
 
-        # Fix the seed height (Dirichlet constraint): solve for the other nodes.
-        mask = np.ones(N, dtype=bool)
-        mask[seed_j * nu + seed_i] = False
-        self._mask = mask
-        Am = A[:, mask]
-        self._seed_part = A[:, ~mask].ravel() * float(z_seed)
-        self._z_seed = float(z_seed)
+def _plan_facets(
+    reflector: MFReflector,
+    source: np.ndarray,
+    focal: float,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    su: int,
+    sv: int,
+    start: Tuple[int, int, float, float],
+    solve_order: List[Tuple[int, int]],
+    parents: Dict[Tuple[int, int], Tuple[int, int]],
+) -> _GridCtx:
+    """为每个面片准备子网格、计算种子（F.Start）与载体高度。"""
+    start_iu, start_iv, start_local_u, start_local_v = start
+    grid = reflector.grid
+    facet_grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+    facet_seeds: Dict[Tuple[int, int], Tuple[int, int, float]] = {}
+    carriers: Dict[Tuple[int, int], np.ndarray] = {}
+    for iu, iv in solve_order:
+        i0 = iu * (su - 1)
+        j0 = iv * (sv - 1)
+        facet_grids[(iu, iv)] = (x_coords[i0:i0 + su], y_coords[j0:j0 + sv])
 
-        # 预分解：K = (AmᵀAm)⁻¹ Amᵀ，每次 solve 只需一次 matvec。
-        # 数值上与 SVD lstsq 同解（差 ~κ·eps）；正规方程奇异时退回 lstsq。
-        self._K: Optional[np.ndarray] = None
-        self._Am: Optional[np.ndarray] = None
-        try:
-            G = Am.T @ Am
-            self._K = np.linalg.inv(G) @ Am.T
-        except np.linalg.LinAlgError:
-            self._Am = Am
+        xx, yy = np.meshgrid(x_coords[i0:i0 + su], y_coords[j0:j0 + sv])
+        carrier = np.asarray(_carrier_z(xx, yy, source, focal), dtype=float)
+        carriers[(iu, iv)] = carrier
 
-    def solve(self, dzx: np.ndarray, dzy: np.ndarray) -> np.ndarray:
-        nv, nu, N = self.nv, self.nu, self.N
-        bx = 0.5 * (dzx[:, :-1] + dzx[:, 1:])
-        by = 0.5 * (dzy[:-1, :] + dzy[1:, :])
-        b_all = np.concatenate((bx.ravel(), by.ravel()))
-        bm = self._sw_sel * b_all[self._sel] - self._seed_part
-        if self._K is not None:
-            sol = self._K @ bm
+        # --- calculation start (F.Start / auto = reference) ---
+        if (iu, iv) == (start_iu, start_iv):
+            seed_u = start_local_u
+            seed_v = start_local_v
         else:
-            sol, *_ = np.linalg.lstsq(self._Am, bm, rcond=None)
-        z = np.zeros(N)
-        z[~self._mask] = self._z_seed
-        z[self._mask] = sol
-        return z.reshape(nv, nu)
+            # automatic start point uses reference position (LS doc)
+            seed_u = float(
+                reflector.calculation_start_u
+                if reflector.calculation_start_u is not None
+                else reflector.reference_position_u
+            )
+            seed_v = float(
+                reflector.calculation_start_v
+                if reflector.calculation_start_v is not None
+                else reflector.reference_position_v
+            )
+        seed_i = int(np.clip(round(seed_u * (su - 1)), 0, su - 1))
+        seed_j = int(np.clip(round(seed_v * (sv - 1)), 0, sv - 1))
+        # Height reference = carrier + grid.start_z at the calculation-start
+        # point (base plane).
+        z_ref = float(carrier[seed_j, seed_i]) + grid.start_z + grid.offset_z
+        facet_seeds[(iu, iv)] = (seed_i, seed_j, z_ref)
+    return _GridCtx(
+        su, sv, grid.n_u, grid.n_v, solve_order, parents,
+        facet_grids, facet_seeds, carriers,
+    )
 
 
-def _reconstruct_height_from_slopes(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-    edge_weight: float = 2.5,
-) -> np.ndarray:
+def _pass_absolute(
+    reflector: MFReflector,
+    source: np.ndarray,
+    spreads,
+    g: _GridCtx,
+    e: _EnergyCtx,
+) -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]]:
+    """Pass 1：每个面片按目标角度独立绝对求解（锚定载体）。
+
+    返回 (绝对高度块, 能量映射)。能量映射先按载体初始化，Pass 1 后按解刷新。
     """
-    Build the *optimal* height field whose gradient matches (dzx, dzy) in LS sense.
+    # Separable H(u), V(v) only.  A 2-D nested CDF makes H depend on v
+    # and V on u, which shears the far-field rectangle into a pillow.
+    energy_maps = {
+        key: (
+            _energy_fracs(xs, ys, g.carriers[key], source, gamma=e.gamma, **e.kw)
+            if e.use_energy
+            else _linear_fracs(g.su, g.sv)
+        )
+        for key, (xs, ys) in g.facet_grids.items()
+    }
 
-    Discrete slope fields from the reflection law are not exactly conservative
-    (path-dependent), so we solve the least-squares gradient-matching problem
-    directly (dense normal equations; per-facet grids are tiny):
-        min_z  sum_j,i ( (z[j,i+1]-z[j,i])/dx - dzx[j,i] )^2
-             + sum_j,i ( (z[j+1,i]-z[j,i])/dy - dzy[j,i] )^2
-    subject to z[seed] = z_seed.  This yields the smoothest surface that best
-    honours the desired slopes and replaces the old ad-hoc Southwell sweeps.
+    def solve_one(key):
+        iu, iv = key
+        xs, ys = g.facet_grids[key]
+        seed_i, seed_j, z_ref = g.facet_seeds[key]
+        raw_target = _target_fn_from_fracs(spreads, iu, iv, *energy_maps[key])
+        return key, _solve_facet_optical(
+            reflector, xs, ys, source, raw_target, g.su, g.sv,
+            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j, z_init=g.carriers[key],
+        )
 
-    单次求解的便捷入口；迭代求解请复用 `_SlopeHeightSolver` 以摊销分解成本。
+    abs_blocks = dict(_parallel_map(solve_one, g.solve_order))
+    if e.use_energy:
+        for key, blk in abs_blocks.items():
+            xs, ys = g.facet_grids[key]
+            energy_maps[key] = _energy_fracs(
+                xs, ys, blk, source, gamma=e.gamma, **e.kw
+            )
+    return abs_blocks, energy_maps
+
+
+def _pass_affine(
+    reflector, source, spreads, g: _GridCtx,
+    abs_blocks, energy_maps,
+) -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], Tuple[float, float, float, float]]]:
+    """Pass 2：边缘极值仿射校准（仅范围），补偿可积投影的整体拉伸/平移。"""
+    calib = _calibrate_facets(abs_blocks, g.facet_grids, source, spreads, g.su, g.sv)
+    acc_calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {
+        k: (0.0, 1.0, 0.0, 1.0) for k in abs_blocks
+    }
+    acc_calib.update(calib)
+
+    def solve_one(key):
+        iu, iv = key
+        xs, ys = g.facet_grids[key]
+        seed_i, seed_j, z_ref = g.facet_seeds[key]
+        a1, b1, a2, b2 = calib[key]
+        base_fn = _target_fn_from_fracs(spreads, iu, iv, *energy_maps[key])
+
+        def cal_target(li: int, lj: int, a1=a1, b1=b1, a2=a2, b2=b2,
+                       base_fn=base_fn) -> Tuple[float, float]:
+            h_deg, v_deg = base_fn(li, lj)
+            return _apply_affine(h_deg, v_deg, a1, b1, a2, b2)
+
+        return key, _solve_facet_optical(
+            reflector, xs, ys, source, cal_target, g.su, g.sv,
+            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
+            z_init=abs_blocks[key],
+        )
+
+    return dict(_parallel_map(solve_one, g.solve_order)), acc_calib
+
+
+def _pass_inverse(
+    reflector, source, spreads, g: _GridCtx, e: _EnergyCtx,
+    cal_blocks, energy_maps, acc_calib,
+):
+    """逆问题迭代：实测反射角 vs 目标角纠偏（均匀光强多轮，否则 1 轮）。
+
+    LucidShape FFD spatial-iterations 默认 1；矩形来自第一个曲面而非循环。
     """
-    return _SlopeHeightSolver(
-        x_coords, y_coords, z_seed, seed_i, seed_j, edge_weight
-    ).solve(dzx, dzy)
+    residual_targets: Dict[Tuple[int, int], object] = {}
+    n_spatial = tuning.SPATIAL_PASSES_UNIFORM if e.use_energy else 1
+    for k in range(n_spatial):
+        gain = (
+            tuning.GAIN_SCHEDULE_BASE * (tuning.GAIN_SCHEDULE_DECAY ** k)
+            if e.use_energy
+            else tuning.GAIN_FIXED
+        )
+        if e.use_energy:
+            for key, blk in cal_blocks.items():
+                xs, ys = g.facet_grids[key]
+                energy_maps[key] = _energy_fracs(
+                    xs, ys, blk, source, gamma=e.gamma, **e.kw
+                )
+
+        def solve_one(key, gain=gain):
+            iu, iv = key
+            xs, ys = g.facet_grids[key]
+            seed_i, seed_j, z_ref = g.facet_seeds[key]
+            a1, b1, a2, b2 = acc_calib[key]
+            fu, fv = energy_maps[key]
+            hs_r, vs_r = _realized_angles_on_block(cal_blocks[key], xs, ys, source)
+            if e.use_energy:
+                flux = _incident_flux_weights(
+                    xs, ys, cal_blocks[key], source, **e.kw
+                )
+                fn = _spatial_intensity_inverse(
+                    iu, iv, g.su, g.sv, spreads, hs_r, vs_r, flux,
+                    gain=gain, target_min=0.1,
+                )
+            else:
+                fn = _separable_inverse_target(
+                    iu, iv, g.su, g.sv, spreads, hs_r, vs_r,
+                    a1, b1, a2, b2, gain=gain, frac_u=fu, frac_v=fv,
+                )
+            blk = _solve_facet_optical(
+                reflector, xs, ys, source, fn, g.su, g.sv,
+                z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
+                z_init=cal_blocks[key],
+            )
+            return key, blk, fn
+
+        new_inv: Dict[Tuple[int, int], np.ndarray] = {}
+        for key, blk, fn in _parallel_map(solve_one, g.solve_order):
+            new_inv[key] = blk
+            residual_targets[key] = fn
+        cal_blocks = new_inv
+    return cal_blocks, residual_targets
 
 
-def _build_height_field(reflector: MFReflector):
+def _polish_energy_blocks(source, spreads, g: _GridCtx, cal_blocks):
+    """均匀光强模式：远场矩形轮廓抛光。"""
+    for key, blk in list(cal_blocks.items()):
+        iu, iv = key
+        xs, ys = g.facet_grids[key]
+        h0, _ = spreads.target_angles_on_facet(iu, iv, 0.0, 0.5)
+        h1, _ = spreads.target_angles_on_facet(iu, iv, 1.0, 0.5)
+        _, v0 = spreads.target_angles_on_facet(iu, iv, 0.5, 0.0)
+        _, v1 = spreads.target_angles_on_facet(iu, iv, 0.5, 1.0)
+        cal_blocks[key] = _polish_farfield_rectangle(
+            blk, xs, ys, source, h0, h1, v0, v1, passes=tuning.POLISH_PASSES,
+        )
+    return cal_blocks
+
+
+def _pass_stitch(
+    reflector, source, spreads, g: _GridCtx, e: _EnergyCtx,
+    cal_blocks, energy_maps, residual_targets, acc_calib,
+    z_step_u: float, z_step_v: float,
+) -> Tuple[Dict[Tuple[int, int], np.ndarray], np.ndarray]:
+    """Pass 3：邻边基线（Dirichlet 重解）或参考点刚性偏移 + Z 台阶，并拼装全局高度场。"""
+    nu = g.n_u * (g.su - 1) + 1
+    nv = g.n_v * (g.sv - 1) + 1
+    z = np.zeros((nv, nu), dtype=float)
+    blocks: Dict[Tuple[int, int], np.ndarray] = {}
+    if reflector.use_base_curve_from_neighbor:
+        # Optional full shared-edge curve matching: average the facing edge
+        # curves of adjacent facets, then re-solve each facet with those
+        # curves as Dirichlet boundary conditions -> C0 borders.  NOTE: this
+        # bends the facet optics near every shared border (the two designs
+        # demand opposite edge slopes), so the far-field range is only
+        # approximate; the reference-point mode below is the optical default.
+        border_curves = _shared_border_curves(cal_blocks, g.su, g.sv)
+
+        def solve_one(key):
+            iu, iv = key
+            xs, ys = g.facet_grids[key]
+            zb = {
+                "left": border_curves[("u", iu, iv)] if iu > 0 else None,
+                "right": border_curves[("u", iu + 1, iv)] if iu < g.n_u - 1 else None,
+                "bottom": border_curves[("v", iu, iv)] if iv > 0 else None,
+                "top": border_curves[("v", iu, iv + 1)] if iv < g.n_v - 1 else None,
+            }
+            ah, bh, av, bv = acc_calib[key]
+            fn = residual_targets.get(key)
+            if fn is None:
+                fu, fv = energy_maps[key]
+                base_fn = _target_fn_from_fracs(spreads, iu, iv, fu, fv)
+
+                def fn(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
+                       base_fn=base_fn) -> Tuple[float, float]:
+                    return _apply_affine(*base_fn(li, lj), ah, bh, av, bv)
+            blk = _solve_facet_with_borders(
+                reflector, cal_blocks[key], spread_target=fn,
+                xs=xs, ys=ys, source=source, zb=zb,
+                su=g.su, sv=g.sv, z_step=float(iu * z_step_u + iv * z_step_v),
+            )
+            return key, blk
+
+        for (iu, iv), blk in _parallel_map(solve_one, g.solve_order):
+            blocks[(iu, iv)] = blk
+            i0 = iu * (g.su - 1)
+            j0 = iv * (g.sv - 1)
+            z[j0:j0 + g.sv, i0:i0 + g.su] = blk
+    else:
+        # Reference-position rigid offset against the BFS parent (the parent
+        # is always already solved, so the old "snap to carrier" patchwork is
+        # gone).  A Z step is added per facet index afterwards.
+        for iu, iv in g.solve_order:
+            i0 = iu * (g.su - 1)
+            j0 = iv * (g.sv - 1)
+            z_loc = cal_blocks[(iu, iv)].copy()
+            parent = g.parents.get((iu, iv))
+            if parent is not None:
+                piu, piv = parent
+                neigh = blocks[(piu, piv)]
+                if piu == iu - 1:
+                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
+                    idx = int(round(ref * (g.sv - 1)))
+                    z_loc += float(neigh[idx, -1] - z_loc[idx, 0])
+                elif piu == iu + 1:
+                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
+                    idx = int(round(ref * (g.sv - 1)))
+                    z_loc += float(neigh[idx, 0] - z_loc[idx, -1])
+                elif piv == iv - 1:
+                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
+                    idx = int(round(ref * (g.su - 1)))
+                    z_loc += float(neigh[-1, idx] - z_loc[0, idx])
+                elif piv == iv + 1:
+                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
+                    idx = int(round(ref * (g.su - 1)))
+                    z_loc += float(neigh[0, idx] - z_loc[-1, idx])
+            z_loc = z_loc + (iu * z_step_u + iv * z_step_v)
+            blocks[(iu, iv)] = z_loc
+            z[j0:j0 + g.sv, i0:i0 + g.su] = z_loc
+    return blocks, z
+
+
+def generate_facets(
+    reflector: MFReflector,
+    samples_u: int | None = None,
+    samples_v: int | None = None,
+) -> List[Facet]:
+    """门面：实际实现在 geometry.facets（延迟导入避免循环依赖）。"""
+    from geometry.facets import generate_facets as _impl
+
+    return _impl(reflector, samples_u, samples_v)
+
+
+def _build_height_field(reflector: MFReflector) -> HeightField:
     """
     LucidShape-style per-facet solve with globally consistent borders.
 
@@ -895,12 +466,7 @@ def _build_height_field(reflector: MFReflector):
         position of the already-computed parent facet is matched (rigid Z
         offset, preserving the optical shape of the new facet).
       - use_base_curve_from_neighbor (default): the new facet connects to its
-        neighbour along the *full* shared-edge curve.  We implement this as a
-        two-pass scheme:
-          1. every facet is solved absolutely (carrier-anchored);
-          2. the shared borders are averaged between the adjacent facets and
-             each facet is re-solved with those border curves as Dirichlet
-             boundary conditions.
+        neighbour along the *full* shared-edge curve via Dirichlet re-solve.
         This makes the whole facet family watertight (C0) at every shared
         border — no banks, wrinkles or twisted step surfaces between facets.
       - Z steps: added per facet index after the border match.
@@ -909,1144 +475,58 @@ def _build_height_field(reflector: MFReflector):
     """
     grid = reflector.grid
     spreads = reflector.spreads
+    if spreads.light_target is not LightTargetType.FAR_FIELD:
+        raise NotImplementedError(
+            f"light_target={spreads.light_target.value!r} 尚未实现——"
+            "引擎当前仅支持 far field（如需其余目标模式请提 issue 或扩展 "
+            "_build_height_field 的目标方向解析）"
+        )
     source = reflector.source.position.copy()
-    source_axis = _source_emission_axis(reflector)
-    source_pattern = getattr(reflector.source, "pattern", "lambertian")
-    source_n = float(getattr(reflector.source, "lambert_n", 1.0))
-    focal = grid.focal
-    order = reflector.solve
-    n_u, n_v = grid.n_u, grid.n_v
     su = max(2, reflector.mesh_u)
     sv = max(2, reflector.mesh_v)
-    nu = n_u * (su - 1) + 1
-    nv = n_v * (sv - 1) + 1
 
-    x_edges = grid.node_x_coords()
-    y_edges = grid.node_y_coords()
-    x_list: List[float] = []
-    for iu in range(n_u):
-        for k in range(su - 1):
-            t = k / (su - 1)
-            x_list.append((1.0 - t) * x_edges[iu] + t * x_edges[iu + 1])
-    x_list.append(x_edges[-1])
-    x_coords = np.asarray(x_list, dtype=float)
+    x_coords, y_coords = _subgrid_coords(grid, su, sv)
+    start = _start_facet(reflector)
+    solve_order, parents = _solve_order(
+        grid.n_u, grid.n_v, (start[0], start[1]), reflector.solve
+    )
+    g = _plan_facets(
+        reflector, source, grid.focal, x_coords, y_coords, su, sv,
+        start, solve_order, parents,
+    )
+    use_energy = bool(spreads.uniform_intensity)
+    e = _EnergyCtx(
+        use_energy=use_energy,
+        kw=dict(
+            axis=_source_emission_axis(reflector),
+            pattern=getattr(reflector.source, "pattern", "lambertian"),
+            lambert_n=float(getattr(reflector.source, "lambert_n", 1.0)),
+        ),
+        gamma=float(getattr(spreads, "energy_gamma", 1.0)) if use_energy else 1.0,
+    )
 
-    y_list: List[float] = []
-    for iv in range(n_v):
-        for k in range(sv - 1):
-            t = k / (sv - 1)
-            y_list.append((1.0 - t) * y_edges[iv] + t * y_edges[iv + 1])
-    y_list.append(y_edges[-1])
-    y_coords = np.asarray(y_list, dtype=float)
-
-    z = np.zeros((nv, nu), dtype=float)
+    abs_blocks, energy_maps = _pass_absolute(reflector, source, spreads, g, e)
+    cal_blocks, acc_calib = _pass_affine(
+        reflector, source, spreads, g, abs_blocks, energy_maps
+    )
+    cal_blocks, residual_targets = _pass_inverse(
+        reflector, source, spreads, g, e, cal_blocks, energy_maps, acc_calib
+    )
+    if e.use_energy:
+        cal_blocks = _polish_energy_blocks(source, spreads, g, cal_blocks)
 
     z_step_u = reflector.z_step_u + reflector.gaps.effective_step_z()
     z_step_v = reflector.z_step_v + reflector.gaps.effective_step_z()
-
-    start_iu, start_iv, start_local_u, start_local_v = _start_facet(reflector)
-    solve_order, parents = _solve_order(n_u, n_v, (start_iu, start_iv), order)
-
-    # ------------------------------------------------------------------
-    # Pass 1: independent optical solve of every facet (absolute heights,
-    # anchored to the carrier at the facet's calculation-start point).
-    # ------------------------------------------------------------------
-    abs_blocks: Dict[Tuple[int, int], np.ndarray] = {}
-    facet_seeds: Dict[Tuple[int, int], Tuple[int, int, float]] = {}
-    facet_grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
-    jobs1: List[tuple] = []
-    for iu, iv in solve_order:
-        i0 = iu * (su - 1)
-        j0 = iv * (sv - 1)
-        xs = x_coords[i0:i0 + su]
-        ys = y_coords[j0:j0 + sv]
-        facet_grids[(iu, iv)] = (xs, ys)
-
-        xx, yy = np.meshgrid(xs, ys)
-        carrier = np.asarray(_carrier_z(xx, yy, source, focal), dtype=float)
-
-        # --- calculation start (F.Start / auto = reference) ---
-        is_seed_facet = (iu, iv) == (start_iu, start_iv)
-        if is_seed_facet:
-            seed_u = start_local_u
-            seed_v = start_local_v
-        else:
-            # automatic start point uses reference position (LS doc)
-            if reflector.calculation_start_u is not None:
-                seed_u = float(reflector.calculation_start_u)
-            else:
-                seed_u = float(reflector.reference_position_u)
-            if reflector.calculation_start_v is not None:
-                seed_v = float(reflector.calculation_start_v)
-            else:
-                seed_v = float(reflector.reference_position_v)
-        seed_i = int(np.clip(round(seed_u * (su - 1)), 0, su - 1))
-        seed_j = int(np.clip(round(seed_v * (sv - 1)), 0, sv - 1))
-        # Height reference = carrier + grid.start_z at the calculation-start
-        # point (base plane).
-        z_ref = float(carrier[seed_j, seed_i]) + grid.start_z + grid.offset_z
-        facet_seeds[(iu, iv)] = (seed_i, seed_j, z_ref)
-
-        # Desired *absolute* slopes from the reflection law, then reconstruct a
-        # height field by least-squares gradient matching so the facet's
-        # reflection angles follow the spread.
-        jobs1.append((iu, iv, xs, ys, carrier, z_ref, seed_i, seed_j))
-
-    use_energy = bool(spreads.uniform_intensity)
-    energy_kw = dict(axis=source_axis, pattern=source_pattern, lambert_n=source_n)
-    energy_gamma = float(getattr(spreads, "energy_gamma", 1.0)) if use_energy else 1.0
-    energy_maps: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
-    for iu, iv, xs, ys, carrier, _z_ref, _si, _sj in jobs1:
-        # Separable H(u), V(v) only.  A 2-D nested CDF makes H depend on v
-        # and V on u, which shears the far-field rectangle into a pillow.
-        energy_maps[(iu, iv)] = (
-            _energy_fracs(xs, ys, carrier, source, gamma=energy_gamma, **energy_kw)
-            if use_energy
-            else _linear_fracs(su, sv)
-        )
-
-    def _pass1_solve(job):
-        iu, iv, xs, ys, carrier, z_ref, seed_i, seed_j = job
-        raw_target = _target_fn_from_fracs(spreads, iu, iv, *energy_maps[(iu, iv)])
-        return (iu, iv), _solve_facet_optical(
-            reflector, xs, ys, source, raw_target, su, sv,
-            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j, z_init=carrier,
-        )
-
-    for key, blk in _parallel_map(_pass1_solve, jobs1):
-        abs_blocks[key] = blk
-
-    if use_energy:
-        for key, blk in abs_blocks.items():
-            xs, ys = facet_grids[key]
-            energy_maps[key] = _energy_fracs(
-                xs, ys, blk, source, gamma=energy_gamma, **energy_kw
-            )
-
-    # ------------------------------------------------------------------
-    # Pass 2: one edge-extrema affine calibration (range only).
-    # Does not lock inconsistent 1-D borders.  Compensates the global
-    # stretch/shift of the integrable projection so the far-field extent
-    # matches the requested rectangle as closely as a single graph allows.
-    # ------------------------------------------------------------------
-    cal_blocks: Dict[Tuple[int, int], np.ndarray] = dict(abs_blocks)
-    acc_calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {
-        k: (0.0, 1.0, 0.0, 1.0) for k in abs_blocks
-    }
-    calib = _calibrate_facets(cal_blocks, facet_grids, source, spreads, su, sv)
-    for key, val in calib.items():
-        acc_calib[key] = val
-
-    def _pass2_solve(key):
-        iu, iv = key
-        xs, ys = facet_grids[(iu, iv)]
-        seed_i, seed_j, z_ref = facet_seeds[(iu, iv)]
-        a1, b1, a2, b2 = calib[(iu, iv)]
-        fu, fv = energy_maps[(iu, iv)]
-
-        base_fn = _target_fn_from_fracs(spreads, iu, iv, fu, fv)
-
-        def cal_target(li: int, lj: int, a1=a1, b1=b1, a2=a2, b2=b2,
-                       base_fn=base_fn) -> Tuple[float, float]:
-            h_deg, v_deg = base_fn(li, lj)
-            return _apply_affine(h_deg, v_deg, a1, b1, a2, b2)
-
-        return key, _solve_facet_optical(
-            reflector, xs, ys, source, cal_target, su, sv,
-            z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
-            z_init=cal_blocks[(iu, iv)],
-        )
-
-    new_blocks: Dict[Tuple[int, int], np.ndarray] = {}
-    for key, blk in _parallel_map(_pass2_solve, solve_order):
-        new_blocks[key] = blk
-    cal_blocks = new_blocks
-
-    # ------------------------------------------------------------------
-    # One inverse pass.  LucidShape FFD spatial-iterations default is 1;
-    # the rectangle has to come from the first surface, not from looping.
-    # ------------------------------------------------------------------
-    residual_targets: Dict[Tuple[int, int], object] = {}
-    n_spatial = 5 if use_energy else 1
-    for k in range(n_spatial):
-        gain = (0.75 * (0.8 ** k)) if use_energy else 0.85
-        if use_energy:
-            for key, blk in cal_blocks.items():
-                xs, ys = facet_grids[key]
-                energy_maps[key] = _energy_fracs(
-                    xs, ys, blk, source, gamma=energy_gamma, **energy_kw
-                )
-
-        def _inverse_solve(key, gain=gain):
-            iu, iv = key
-            xs, ys = facet_grids[(iu, iv)]
-            seed_i, seed_j, z_ref = facet_seeds[(iu, iv)]
-            a1, b1, a2, b2 = acc_calib[(iu, iv)]
-            fu, fv = energy_maps[(iu, iv)]
-            hs_r, vs_r = _realized_angles_on_block(
-                cal_blocks[(iu, iv)], xs, ys, source
-            )
-            if use_energy:
-                flux = _incident_flux_weights(
-                    xs, ys, cal_blocks[(iu, iv)], source, **energy_kw
-                )
-                fn = _spatial_intensity_inverse(
-                    iu, iv, su, sv, spreads, hs_r, vs_r, flux,
-                    gain=gain, target_min=0.1,
-                )
-            else:
-                fn = _separable_inverse_target(
-                    iu, iv, su, sv, spreads, hs_r, vs_r,
-                    a1, b1, a2, b2, gain=gain, frac_u=fu, frac_v=fv,
-                )
-            blk = _solve_facet_optical(
-                reflector, xs, ys, source, fn, su, sv,
-                z_seed=z_ref, seed_i=seed_i, seed_j=seed_j,
-                z_init=cal_blocks[(iu, iv)],
-            )
-            return key, blk, fn
-
-        new_inv: Dict[Tuple[int, int], np.ndarray] = {}
-        for key, blk, fn in _parallel_map(_inverse_solve, solve_order):
-            new_inv[key] = blk
-            residual_targets[key] = fn
-        cal_blocks = new_inv
-
-    if use_energy:
-        for key, blk in list(cal_blocks.items()):
-            iu, iv = key
-            xs, ys = facet_grids[key]
-            h0, _ = spreads.target_angles_on_facet(iu, iv, 0.0, 0.5)
-            h1, _ = spreads.target_angles_on_facet(iu, iv, 1.0, 0.5)
-            _, v0 = spreads.target_angles_on_facet(iu, iv, 0.5, 0.0)
-            _, v1 = spreads.target_angles_on_facet(iu, iv, 0.5, 1.0)
-            flux = _incident_flux_weights(xs, ys, blk, source, **energy_kw)
-            cal_blocks[key] = _polish_farfield_rectangle(
-                blk, xs, ys, source, h0, h1, v0, v1, flux=flux, passes=6,
-            )
-
-    # ------------------------------------------------------------------
-    # Pass 3: neighbour influence.
-    # ------------------------------------------------------------------
-    blocks: Dict[Tuple[int, int], np.ndarray] = {}
-    if reflector.use_base_curve_from_neighbor:
-        # Optional full shared-edge curve matching: average the facing edge
-        # curves of adjacent facets, then re-solve each facet with those
-        # curves as Dirichlet boundary conditions -> C0 borders.  NOTE: this
-        # bends the facet optics near every shared border (the two designs
-        # demand opposite edge slopes), so the far-field range is only
-        # approximate; the reference-point mode below is the optical default.
-        border_curves = _shared_border_curves(cal_blocks, su, sv)
-
-        def _pass3_solve(key):
-            iu, iv = key
-            xs, ys = facet_grids[(iu, iv)]
-            zb = {
-                "left": border_curves[("u", iu, iv)] if iu > 0 else None,
-                "right": border_curves[("u", iu + 1, iv)] if iu < n_u - 1 else None,
-                "bottom": border_curves[("v", iu, iv)] if iv > 0 else None,
-                "top": border_curves[("v", iu, iv + 1)] if iv < n_v - 1 else None,
-            }
-            ah, bh, av, bv = acc_calib[(iu, iv)]
-            fn = residual_targets.get((iu, iv))
-            if fn is None:
-                fu, fv = energy_maps[(iu, iv)]
-                base_fn = _target_fn_from_fracs(spreads, iu, iv, fu, fv)
-
-                def fn(li: int, lj: int, ah=ah, bh=bh, av=av, bv=bv,
-                       base_fn=base_fn) -> Tuple[float, float]:
-                    return _apply_affine(*base_fn(li, lj), ah, bh, av, bv)
-            blk = _solve_facet_with_borders(
-                reflector, cal_blocks[(iu, iv)], spread_target=fn,
-                xs=xs, ys=ys, source=source, zb=zb,
-                su=su, sv=sv, z_step=float(iu * z_step_u + iv * z_step_v),
-            )
-            return key, blk
-
-        for (iu, iv), blk in _parallel_map(_pass3_solve, solve_order):
-            blocks[(iu, iv)] = blk
-            i0 = iu * (su - 1)
-            j0 = iv * (sv - 1)
-            z[j0:j0 + sv, i0:i0 + su] = blk
-    else:
-        # Reference-position rigid offset against the BFS parent (the parent
-        # is always already solved, so the old "snap to carrier" patchwork is
-        # gone).  A Z step is added per facet index afterwards.
-        solved: Dict[Tuple[int, int], np.ndarray] = {}
-        for iu, iv in solve_order:
-            i0 = iu * (su - 1)
-            j0 = iv * (sv - 1)
-            xs = x_coords[i0:i0 + su]
-            ys = y_coords[j0:j0 + sv]
-            z_loc = cal_blocks[(iu, iv)].copy()
-            parent = parents.get((iu, iv))
-            if parent is not None:
-                piu, piv = parent
-                neigh = solved[(piu, piv)]
-                if piu == iu - 1:
-                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
-                    idx = int(round(ref * (sv - 1)))
-                    z_loc += float(neigh[idx, -1] - z_loc[idx, 0])
-                elif piu == iu + 1:
-                    ref = float(np.clip(reflector.reference_position_v, 0.0, 1.0))
-                    idx = int(round(ref * (sv - 1)))
-                    z_loc += float(neigh[idx, 0] - z_loc[idx, -1])
-                elif piv == iv - 1:
-                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
-                    idx = int(round(ref * (su - 1)))
-                    z_loc += float(neigh[-1, idx] - z_loc[0, idx])
-                elif piv == iv + 1:
-                    ref = float(np.clip(reflector.reference_position_u, 0.0, 1.0))
-                    idx = int(round(ref * (su - 1)))
-                    z_loc += float(neigh[0, idx] - z_loc[-1, idx])
-            z_loc = z_loc + (iu * z_step_u + iv * z_step_v)
-            solved[(iu, iv)] = z_loc.copy()
-            blocks[(iu, iv)] = z_loc.copy()
-            z[j0:j0 + sv, i0:i0 + su] = z_loc
-
-    return x_coords, y_coords, z, su, sv, blocks
+    blocks, z = _pass_stitch(
+        reflector, source, spreads, g, e,
+        cal_blocks, energy_maps, residual_targets, acc_calib, z_step_u, z_step_v,
+    )
+    return HeightField(x_coords, y_coords, z, su, sv, blocks)
 
 
 # ---------------------------------------------------------------------------
 # Per-facet optical solve + spread calibration
 # ---------------------------------------------------------------------------
-
-
-def _level_row_h(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    h0: float,
-    h1: float,
-    seed_i: int,
-    gain: float = 0.45,
-) -> np.ndarray:
-    """
-    Per-row H-endpoint correction.
-
-    A linear Δz = s(y)·(x-xmid) only *shifts* the whole row in H
-    (Δzx is constant).  The inverted-trapezoid error is a *span*
-    error, so we also add a quadratic stretch
-        Δz = c(y)·(x-xmid)²
-    which gives opposite Δzx on the two H edges.  A 2×2 Newton per
-    row solves (shift, stretch) so both endpoints approach (h0, h1).
-    """
-    z = np.asarray(z, dtype=float).copy()
-    xs = np.asarray(xs, dtype=float)
-    nv, nu = z.shape
-    if nu < 3:
-        return z
-    mid_i = nu // 2
-    seed_i = int(np.clip(mid_i if seed_i is None else seed_i, 0, nu - 1))
-    lever = xs - xs[seed_i]
-    quad = lever * lever
-    hs, _ = _realized_angles_on_block(z, xs, ys, source)
-    eps_s, eps_c = 1e-4, 1e-5
-    hs_s, _ = _realized_angles_on_block(z + eps_s * lever[None, :], xs, ys, source)
-    hs_c, _ = _realized_angles_on_block(z + eps_c * quad[None, :], xs, ys, source)
-    Js0 = (hs_s[:, 0] - hs[:, 0]) / eps_s
-    Js1 = (hs_s[:, -1] - hs[:, -1]) / eps_s
-    Jc0 = (hs_c[:, 0] - hs[:, 0]) / eps_c
-    Jc1 = (hs_c[:, -1] - hs[:, -1]) / eps_c
-    e0 = float(h0) - hs[:, 0]
-    e1 = float(h1) - hs[:, -1]
-    g = float(gain)
-    span = float(np.max(np.abs(xs)) + 1.0)
-    s = np.zeros(nv, dtype=float)
-    c = np.zeros(nv, dtype=float)
-    for j in range(nv):
-        A = np.array([[Js0[j], Jc0[j]], [Js1[j], Jc1[j]]], dtype=float)
-        try:
-            det = float(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
-        except Exception:
-            det = 0.0
-        if abs(det) < 1e-10:
-            continue
-        sc = np.linalg.solve(A, np.array([e0[j], e1[j]], dtype=float))
-        s[j] = sc[0]
-        c[j] = sc[1]
-    s = np.clip(g * s, -0.20, 0.20)
-    c = np.clip(g * c, -0.20 / max(span, 1.0), 0.20 / max(span, 1.0))
-    z += s[:, None] * lever[None, :] + c[:, None] * quad[None, :]
-    return z
-
-
-def _level_col_v(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    v0: float,
-    v1: float,
-    seed_j: int,
-    gain: float = 0.45,
-) -> np.ndarray:
-    """
-    Per-column V-endpoint correction (shift + quadratic stretch).
-    Symmetric of `_level_row_h`.
-    """
-    z = np.asarray(z, dtype=float).copy()
-    ys = np.asarray(ys, dtype=float)
-    nv, nu = z.shape
-    if nv < 3:
-        return z
-    mid_j = nv // 2
-    seed_j = int(np.clip(mid_j if seed_j is None else seed_j, 0, nv - 1))
-    lever = ys - ys[seed_j]
-    quad = lever * lever
-    _, vs = _realized_angles_on_block(z, xs, ys, source)
-    eps_s, eps_c = 1e-4, 1e-5
-    _, vs_s = _realized_angles_on_block(z + eps_s * lever[:, None], xs, ys, source)
-    _, vs_c = _realized_angles_on_block(z + eps_c * quad[:, None], xs, ys, source)
-    Js0 = (vs_s[0, :] - vs[0, :]) / eps_s
-    Js1 = (vs_s[-1, :] - vs[-1, :]) / eps_s
-    Jc0 = (vs_c[0, :] - vs[0, :]) / eps_c
-    Jc1 = (vs_c[-1, :] - vs[-1, :]) / eps_c
-    e0 = float(v0) - vs[0, :]
-    e1 = float(v1) - vs[-1, :]
-    g = float(gain)
-    span = float(np.max(np.abs(ys)) + 1.0)
-    s = np.zeros(nu, dtype=float)
-    c = np.zeros(nu, dtype=float)
-    for i in range(nu):
-        A = np.array([[Js0[i], Jc0[i]], [Js1[i], Jc1[i]]], dtype=float)
-        det = float(A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0])
-        if abs(det) < 1e-10:
-            continue
-        sc = np.linalg.solve(A, np.array([e0[i], e1[i]], dtype=float))
-        s[i] = sc[0]
-        c[i] = sc[1]
-    s = np.clip(g * s, -0.20, 0.20)
-    c = np.clip(g * c, -0.20 / max(span, 1.0), 0.20 / max(span, 1.0))
-    z += s[None, :] * lever[:, None] + c[None, :] * quad[:, None]
-    return z
-
-
-def _pin_v_edge_nodes(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    v0: float,
-    v1: float,
-    gain: float = 0.7,
-    zclip: float = 0.25,
-) -> np.ndarray:
-    """
-    Flatten realized V on the top and bottom *bands* (not a single row).
-
-    A one-row z bump is invisible to a degree-5 interpolating NURBS, so
-    the exported surface keeps the FFD smile (corners at V≈−17°, centre
-    at −11°).  Spreading the same Newton step over a few rows keeps zy
-    after the fit.
-    """
-    z = np.asarray(z, dtype=float).copy()
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    nv, nu = z.shape
-    if nv < 2:
-        return z
-    _, vs = _realized_angles_on_block(z, xs, ys, source)
-    eps = 1e-4
-    g = float(gain)
-    z_b = z.copy()
-    z_b[0, :] += eps
-    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
-    dV = (vs_b[0, :] - vs[0, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    z[0, :] += np.clip(g * (float(v0) - vs[0, :]) / dV, -zclip, zclip)
-
-    z_t = z.copy()
-    z_t[-1, :] += eps
-    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
-    dV = (vs_t[-1, :] - vs[-1, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    z[-1, :] += np.clip(g * (float(v1) - vs[-1, :]) / dV, -zclip, zclip)
-    return z
-
-
-def _kill_v_smile(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    v0: float,
-    v1: float,
-    gain: float = 0.6,
-) -> np.ndarray:
-    """
-    Flatten a smiling / arched V outline with a smooth Δz that NURBS can keep.
-
-    φ_bot(y) = ((y_top-y)/span)² is 1 on the bottom edge and 0 on the top,
-    so a per-column amplitude a(x) changes V at the floor without a
-    one-row spike (which degree-5 interpolation discards).
-    """
-    z = np.asarray(z, dtype=float).copy()
-    ys = np.asarray(ys, dtype=float)
-    nv, nu = z.shape
-    if nv < 3:
-        return z
-    span = float(ys[-1] - ys[0])
-    if abs(span) < 1e-12:
-        return z
-    phi_bot = np.square((ys[-1] - ys) / span)
-    phi_top = np.square((ys - ys[0]) / span)
-    _, vs = _realized_angles_on_block(z, xs, ys, source)
-    eps = 1e-4
-    g = float(gain)
-
-    z_b = z + eps * phi_bot[:, None]
-    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
-    dV = (vs_b[0, :] - vs[0, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    a_b = np.clip(g * (float(v0) - vs[0, :]) / dV, -0.35, 0.35)
-    z = z + a_b[None, :] * phi_bot[:, None]
-
-    _, vs = _realized_angles_on_block(z, xs, ys, source)
-    z_t = z + eps * phi_top[:, None]
-    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
-    dV = (vs_t[-1, :] - vs[-1, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    a_t = np.clip(g * (float(v1) - vs[-1, :]) / dV, -0.35, 0.35)
-    z = z + a_t[None, :] * phi_top[:, None]
-    return z
-
-
-def _polish_farfield_rectangle(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    h0: float,
-    h1: float,
-    v0: float,
-    v1: float,
-    flux: Optional[np.ndarray] = None,
-    passes: int = 6,
-) -> np.ndarray:
-    """
-    Surface-space outline lock.
-
-    1. Per-row H shift+stretch kills the off-axis inverted trapezoid.
-    2. Pin first/last V rows to (Vmin, Vmax).  Needed when F.Start
-       sits on the +V edge and that row overshoots the angle list.
-    3. Light four-edge Newton cleans leftover corner errors.
-    """
-    z = np.asarray(z, dtype=float).copy()
-    nu = z.shape[1]
-    # Keep this mild.  Stacking H-quadratic + multi-row V pin + four-edge
-    # Newton made the NURBS corners spray rays (the two "legs" at ±15°, −25°).
-    npass = min(3, max(1, int(passes)))
-    for k in range(npass):
-        g = 0.40 * (0.85 ** k)
-        z = _level_row_h(z, xs, ys, source, h0, h1, seed_i=nu // 2, gain=g)
-    for k in range(3):
-        z = _pin_v_edge_nodes(
-            z, xs, ys, source, v0, v1, gain=0.50 * (0.85 ** k), zclip=0.12,
-        )
-    return z
-
-
-def _solve_facet_optical(
-    reflector: MFReflector,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    target_fn,
-    su: int,
-    sv: int,
-    z_seed: float,
-    seed_i: int,
-    seed_j: int,
-    z_init: np.ndarray,
-) -> np.ndarray:
-    """
-    Single surface from a seed height.
-
-    Uniform-intensity / LucidShape FFD: path-integrate the reflection-law
-    slopes in the user's FunGeo order and lock the four graph edges.
-    Least-squares averaging of those slopes is what flattened every row
-    onto the same zx and left the inverted trapezoid LucidShape does not
-    produce on the same inputs.
-
-    Off (legacy): conservative LS projection only.
-    """
-    max_iter = max(1, int(reflector.solver_iterations))
-    tol = max(0.0, float(reflector.solver_tolerance))
-    z_loc = np.asarray(z_init, dtype=float).copy()
-    h_grid, v_grid = _eval_target_grid(target_fn, su, sv)
-    # 设计矩阵只依赖网格几何：整个迭代序列复用一次预分解。
-    ls_solver = _SlopeHeightSolver(xs, ys, z_seed, seed_i, seed_j, edge_weight=2.5)
-    # 网格坐标与目标方向在迭代间不变，一并提到循环外。
-    xx, yy = np.meshgrid(xs, ys)
-    targets = _target_direction_from_angles(h_grid, v_grid)
-    use_sep = bool(getattr(reflector.spreads, "uniform_intensity", False))
-    for _ in range(max_iter):
-        dzx, dzy = _slopes_on_surface_static(xx, yy, z_loc, source, targets)
-        if use_sep:
-            z_u = _reconstruct_height_by_paths(
-                dzx, dzy, xs, ys, z_seed, seed_i, seed_j, SolveMethod.U_FIRST,
-            )
-            z_ls = ls_solver.solve(dzx, dzy)
-            # Paths keep iso-V from smiling; LS keeps a single smooth
-            # graph.  FFD border-lock + heavy polish sprayed the corners.
-            z_new = 0.35 * z_u + 0.65 * z_ls
-        else:
-            z_new = ls_solver.solve(dzx, dzy)
-        delta = float(np.max(np.abs(z_new - z_loc)))
-        z_loc = z_new
-        if delta <= tol:
-            break
-    return z_loc
-
-
-def _double_coords(coords: np.ndarray) -> np.ndarray:
-    c = np.asarray(coords, dtype=float)
-    out = np.empty(c.size * 2 - 1, dtype=float)
-    out[::2] = c
-    out[1::2] = 0.5 * (c[:-1] + c[1:])
-    return out
-
-
-def _double_field(field: np.ndarray) -> np.ndarray:
-    a = np.asarray(field, dtype=float)
-    nv, nu = a.shape
-    out = np.empty((nv * 2 - 1, nu * 2 - 1), dtype=float)
-    out[::2, ::2] = a
-    out[::2, 1::2] = 0.5 * (a[:, :-1] + a[:, 1:])
-    out[1::2, ::2] = 0.5 * (a[:-1, :] + a[1:, :])
-    out[1::2, 1::2] = 0.25 * (
-        a[:-1, :-1] + a[:-1, 1:] + a[1:, :-1] + a[1:, 1:]
-    )
-    return out
-
-
-def _realized_angles_on_block(
-    blk: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Reflected (h, v) deg at every node of a height-field block."""
-    sv, su = blk.shape
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    blk = np.asarray(blk, dtype=float)
-    zx = np.empty((sv, su), dtype=float)
-    zy = np.empty((sv, su), dtype=float)
-    if su >= 2:
-        zx[:, 0] = (blk[:, 1] - blk[:, 0]) / (xs[1] - xs[0])
-        zx[:, -1] = (blk[:, -1] - blk[:, -2]) / (xs[-1] - xs[-2])
-    else:
-        zx[:] = 0.0
-    if su >= 3:
-        zx[:, 1:-1] = (blk[:, 2:] - blk[:, :-2]) / (xs[2:] - xs[:-2])
-    if sv >= 2:
-        zy[0, :] = (blk[1, :] - blk[0, :]) / (ys[1] - ys[0])
-        zy[-1, :] = (blk[-1, :] - blk[-2, :]) / (ys[-1] - ys[-2])
-    else:
-        zy[:] = 0.0
-    if sv >= 3:
-        zy[1:-1, :] = (blk[2:, :] - blk[:-2, :]) / (ys[2:] - ys[:-2])[:, None]
-    n = np.stack((-zx, -zy, np.ones((sv, su), dtype=float)), axis=-1)
-    ln = np.linalg.norm(n, axis=-1, keepdims=True)
-    valid = ln[..., 0] >= 1e-14
-    n = np.divide(n, np.maximum(ln, 1e-30))
-    xx, yy = np.meshgrid(xs, ys)
-    pts = np.stack((xx, yy, blk), axis=-1)
-    I = pts - np.asarray(source, dtype=float).reshape(3)
-    I = _unit_nd(I)
-    dots = np.sum(I * n, axis=-1, keepdims=True)
-    R = I - 2.0 * dots * n
-    R = _unit_nd(R)
-    hs = np.rad2deg(np.arctan2(R[..., 0], R[..., 2]))
-    vs = np.rad2deg(np.arcsin(np.clip(R[..., 1], -1.0, 1.0)))
-    hs = np.where(valid, hs, 0.0)
-    vs = np.where(valid, vs, 0.0)
-    return hs, vs
-
-
-def _intensity_scale_field(
-    hs: np.ndarray,
-    vs: np.ndarray,
-    flux: Optional[np.ndarray],
-    h0: float,
-    h1: float,
-    v0: float,
-    v1: float,
-    target_min: float = 0.1,
-) -> np.ndarray:
-    """I_tgt / I(H,V) per node.  Dark bins (>1) get a larger Δz push."""
-    shape = np.asarray(hs).shape
-    scale = np.ones(shape, dtype=float)
-    if flux is None:
-        return scale
-    w = np.maximum(np.asarray(flux, dtype=float), 0.0)
-    hr = np.asarray(hs, dtype=float).ravel()
-    vr = np.asarray(vs, dtype=float).ravel()
-    wr = w.ravel()
-    if wr.size == 0 or float(np.max(wr)) <= 0.0:
-        return scale
-    h_lo, h_hi = (h0, h1) if h0 <= h1 else (h1, h0)
-    v_lo, v_hi = (v0, v1) if v0 <= v1 else (v1, v0)
-    nh, nv = 20, 12
-    he = np.linspace(h_lo, h_hi, nh + 1)
-    ve = np.linspace(v_lo, v_hi, nv + 1)
-    hist, _, _ = np.histogram2d(hr, vr, bins=[he, ve], weights=wr)
-    dA = abs((he[1] - he[0]) * (ve[1] - ve[0])) + 1e-30
-    Imap = hist / dA
-    peak = float(np.max(Imap))
-    I_tgt = float(np.sum(wr)) / max(abs((h_hi - h_lo) * (v_hi - v_lo)), 1e-9)
-    floor = (target_min * peak) if peak > 0.0 else I_tgt
-    I_tgt = max(I_tgt, floor)
-    ih = np.clip(np.digitize(hs, he) - 1, 0, nh - 1)
-    iv = np.clip(np.digitize(vs, ve) - 1, 0, nv - 1)
-    I_node = Imap[ih, iv]
-    return np.clip(I_tgt / np.maximum(I_node, floor), 0.45, 2.2)
-
-
-def _reach_rectangle_on_surface(
-    z: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    h0: float,
-    h1: float,
-    v0: float,
-    v1: float,
-    gain: float = 0.6,
-    flux: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """
-    Surface-space Newton on the four graph edges so each column
-    reaches Vmin/Vmax and each row reaches Hmin/Hmax.
-
-    Angle-space V(H) warps leak into the opposite edge.  A local z
-    bump only changes zx/zy at that border.
-    """
-    z = np.asarray(z, dtype=float).copy()
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    nv, nu = z.shape
-    if nv < 2 or nu < 2:
-        return z
-    hs, vs = _realized_angles_on_block(z, xs, ys, source)
-    sc = _intensity_scale_field(hs, vs, flux, h0, h1, v0, v1)
-    eps = 1e-4
-    g = float(gain)
-
-    z_b = z.copy()
-    z_b[0, :] += eps
-    _, vs_b = _realized_angles_on_block(z_b, xs, ys, source)
-    dV = (vs_b[0, :] - vs[0, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    z[0, :] += np.clip(g * sc[0, :] * (v0 - vs[0, :]) / dV, -0.08, 0.08)
-
-    z_t = z.copy()
-    z_t[-1, :] += eps
-    _, vs_t = _realized_angles_on_block(z_t, xs, ys, source)
-    dV = (vs_t[-1, :] - vs[-1, :]) / eps
-    dV = np.where(np.abs(dV) < 1e-8, 1e-8, dV)
-    z[-1, :] += np.clip(g * sc[-1, :] * (v1 - vs[-1, :]) / dV, -0.08, 0.08)
-
-    z_l = z.copy()
-    z_l[:, 0] += eps
-    hs_l, _ = _realized_angles_on_block(z_l, xs, ys, source)
-    dH = (hs_l[:, 0] - hs[:, 0]) / eps
-    dH = np.where(np.abs(dH) < 1e-8, 1e-8, dH)
-    z[:, 0] += np.clip(g * sc[:, 0] * (h0 - hs[:, 0]) / dH, -0.08, 0.08)
-
-    z_r = z.copy()
-    z_r[:, -1] += eps
-    hs_r, _ = _realized_angles_on_block(z_r, xs, ys, source)
-    dH = (hs_r[:, -1] - hs[:, -1]) / eps
-    dH = np.where(np.abs(dH) < 1e-8, 1e-8, dH)
-    z[:, -1] += np.clip(g * sc[:, -1] * (h1 - hs[:, -1]) / dH, -0.08, 0.08)
-    return z
-
-
-def _as_1d_frac(frac: Optional[np.ndarray], n: int, along_u: bool) -> Optional[np.ndarray]:
-    if frac is None:
-        return None
-    arr = np.asarray(frac, dtype=float)
-    if arr.ndim == 2:
-        arr = arr.mean(axis=0) if along_u else arr.mean(axis=1)
-    arr = arr.ravel()
-    if arr.size == n:
-        return arr
-    if arr.size <= 1:
-        return np.linspace(0.0, 1.0, n)
-    t = np.linspace(0.0, 1.0, arr.size)
-    return np.interp(np.linspace(0.0, 1.0, n), t, arr)
-
-
-def _flux_quantile_map(
-    values: np.ndarray,
-    weights: np.ndarray,
-    v0: float,
-    v1: float,
-    target_min: float = 0.1,
-) -> np.ndarray:
-    """
-    Histogram-equalize realized angles by flux.
-
-    Sort samples by realized angle, form a flux CDF (weights floored at
-    target_min × peak so empty bins cannot steal the map), and send
-    each lumen to a uniform position in [v0, v1].
-    """
-    v = np.asarray(values, dtype=float).ravel()
-    w = np.maximum(np.asarray(weights, dtype=float).ravel(), 0.0)
-    out = v.copy()
-    if v.size == 0:
-        return out
-    peak = float(np.max(w)) if w.size else 0.0
-    if peak <= 1e-30:
-        return out
-    w = np.maximum(w, float(target_min) * peak)
-    order = np.argsort(v, kind="mergesort")
-    cdf = np.cumsum(w[order])
-    total = float(cdf[-1])
-    if total <= 1e-30:
-        return out
-    cdf = cdf / total
-    des = float(v0) + (float(v1) - float(v0)) * cdf
-    out[order] = des
-    return out
-
-
-def _spatial_intensity_inverse(
-    iu: int,
-    iv: int,
-    su: int,
-    sv: int,
-    spreads,
-    realized_h: np.ndarray,
-    realized_v: np.ndarray,
-    flux: np.ndarray,
-    gain: float = 0.8,
-    target_min: float = 0.1,
-):
-    """
-    One FFD-style spatial step: flatten I(H,V) by equalizing flux vs
-    realized H and vs realized V, keeping a rectangular outline.
-    """
-    h0, _ = spreads.target_angles_on_facet(iu, iv, 0.0, 0.5)
-    h1, _ = spreads.target_angles_on_facet(iu, iv, 1.0, 0.5)
-    _, v0 = spreads.target_angles_on_facet(iu, iv, 0.5, 0.0)
-    _, v1 = spreads.target_angles_on_facet(iu, iv, 0.5, 1.0)
-    rh = np.asarray(realized_h, dtype=float)
-    rv = np.asarray(realized_v, dtype=float)
-    w = np.maximum(np.asarray(flux, dtype=float), 0.0)
-    h_des = _flux_quantile_map(rh, w, h0, h1, target_min).reshape(rh.shape)
-    v_des = _flux_quantile_map(rv, w, v0, v1, target_min).reshape(rv.shape)
-    col = np.maximum(w.sum(axis=0), 1e-30)
-    row = np.maximum(w.sum(axis=1), 1e-30)
-    eq_h = (h_des * w).sum(axis=0) / col
-    eq_v = (v_des * w).sum(axis=1) / row
-    real_h = (rh * w).sum(axis=0) / col
-    real_v = (rv * w).sum(axis=1) / row
-    asked_h = eq_h + float(gain) * (eq_h - real_h)
-    asked_v = eq_v + float(gain) * (eq_v - real_v)
-    h_lo, h_hi = (h0, h1) if h0 <= h1 else (h1, h0)
-    v_lo, v_hi = (v0, v1) if v0 <= v1 else (v1, v0)
-    asked_h = np.clip(asked_h, h_lo, h_hi)
-    asked_v = np.clip(asked_v, v_lo, v_hi)
-    asked_h[0] = h0
-    asked_h[-1] = h1
-    asked_v[0] = v0
-    asked_v[-1] = v1
-
-    def fn(li, lj, ah=asked_h, av=asked_v):
-        ci = np.clip(li, 0, su - 1)
-        cj = np.clip(lj, 0, sv - 1)
-        if np.ndim(li) > 0 or np.ndim(lj) > 0:
-            return ah[ci.astype(int)], av[cj.astype(int)]
-        return float(ah[int(ci)]), float(av[int(cj)])
-
-    return _row_h_preemphasis(fn, realized_h, h0, h1, gain=0.55)
-
-
-def _row_h_preemphasis(
-    inner_fn,
-    realized_h: np.ndarray,
-    h0: float,
-    h1: float,
-    gain: float = 0.55,
-):
-    """
-    Per-row H-span calibration in angle space.
-
-    Off-axis LS realizes a slightly wider top than bottom.  Scale each
-    row's asked H toward (h1-h0)/realized_span so the next solve
-    straightens the sides without a z-space warp.
-    """
-    rh = np.asarray(realized_h, dtype=float)
-    nv = rh.shape[0]
-    want = float(h1) - float(h0)
-    got = rh[:, -1] - rh[:, 0]
-    scale = np.ones(nv, dtype=float)
-    ok = np.abs(got) > 1e-6
-    scale[ok] = want / got[ok]
-    scale = 1.0 + float(gain) * (scale - 1.0)
-    scale = np.clip(scale, 0.90, 1.10)
-    mid = 0.5 * (float(h0) + float(h1))
-    half = 0.5 * abs(want) * 1.12
-
-    def fn(li, lj, inner=inner_fn, sc=scale, mid=mid, half=half):
-        h, v = inner(li, lj)
-        cj = np.clip(lj, 0, sc.size - 1)
-        if np.ndim(li) > 0 or np.ndim(lj) > 0:
-            s = sc[cj.astype(int)]
-        else:
-            s = float(sc[int(cj)])
-            return float(np.clip(mid + s * (h - mid), mid - half, mid + half)), v
-        return np.clip(mid + s * (h - mid), mid - half, mid + half), v
-
-    return fn
-
-
-def _energy_separable_inverse(
-    iu: int,
-    iv: int,
-    su: int,
-    sv: int,
-    spreads,
-    realized_h: np.ndarray,
-    realized_v: np.ndarray,
-    flux: np.ndarray,
-    a1: float,
-    b1: float,
-    a2: float,
-    b2: float,
-    frac_u: Optional[np.ndarray],
-    frac_v: Optional[np.ndarray],
-    gain: float = 1.0,
-):
-    """
-    Separable energy inverse that keeps a rectangular far-field outline.
-
-    H is a function of u only, V of v only (isolines stay axis-aligned).
-    Endpoints are pinned to the angle-list edges so the spot stays a
-    rectangle; the interior is flux-weighted so equal flux lands in
-    equal angle bins.
-    """
-    if abs(b1) < 1e-6:
-        b1 = 1.0
-    if abs(b2) < 1e-6:
-        b2 = 1.0
-    fu = _as_1d_frac(frac_u, su, True)
-    fv = _as_1d_frac(frac_v, sv, False)
-    tgt_h = np.zeros(su)
-    tgt_v = np.zeros(sv)
-    for i in range(su):
-        lu = float(fu[i]) if fu is not None else i / max(su - 1, 1)
-        tgt_h[i] = spreads.target_angles_on_facet(iu, iv, lu, 0.5)[0]
-    for j in range(sv):
-        lv = float(fv[j]) if fv is not None else j / max(sv - 1, 1)
-        tgt_v[j] = spreads.target_angles_on_facet(iu, iv, 0.5, lv)[1]
-
-    w = np.maximum(np.asarray(flux, dtype=float), 0.0)
-    col = np.maximum(w.sum(axis=0), 1e-30)
-    row = np.maximum(w.sum(axis=1), 1e-30)
-    real_h = (np.asarray(realized_h, dtype=float) * w).sum(axis=0) / col
-    real_v = (np.asarray(realized_v, dtype=float) * w).sum(axis=1) / row
-
-    # Value match after affine range calib.
-    asked_h = (tgt_h - a1) / b1 + float(gain) * (tgt_h - real_h)
-    asked_v = (tgt_v - a2) / b2 + float(gain) * (tgt_v - real_v)
-
-    # Spacing match: the hot centre is a Jacobian error (dH/du too small
-    # in the middle), not a pointwise aiming error at u=0.5.  Restore
-    # target interval sizes where the realised profile is compressed.
-    def _spacing_equalize(tgt: np.ndarray, real: np.ndarray, asked: np.ndarray) -> np.ndarray:
-        if tgt.size < 3:
-            return asked
-        dt = np.diff(tgt)
-        dr = np.diff(real)
-        da = dt + float(gain) * (dt - dr)
-        sgn = np.sign(dt)
-        sgn[sgn == 0.0] = 1.0
-        floor = 0.08 * np.maximum(np.abs(dt), 1e-3)
-        da = sgn * np.maximum(np.abs(da), floor)
-        integ = np.concatenate(([0.0], np.cumsum(da)))
-        span = integ[-1] - integ[0]
-        if abs(span) < 1e-9:
-            return asked
-        shaped = tgt[0] + (tgt[-1] - tgt[0]) * (integ - integ[0]) / span
-        return 0.45 * asked + 0.55 * shaped
-
-    asked_h = _spacing_equalize(tgt_h, real_h, asked_h)
-    asked_v = _spacing_equalize(tgt_v, real_v, asked_v)
-
-    h0, _ = spreads.target_angles_on_facet(iu, iv, 0.0, 0.5)
-    h1, _ = spreads.target_angles_on_facet(iu, iv, 1.0, 0.5)
-    _, v0 = spreads.target_angles_on_facet(iu, iv, 0.5, 0.0)
-    _, v1 = spreads.target_angles_on_facet(iu, iv, 0.5, 1.0)
-    h_lo, h_hi = (h0, h1) if h0 <= h1 else (h1, h0)
-    v_lo, v_hi = (v0, v1) if v0 <= v1 else (v1, v0)
-    asked_h = np.clip(asked_h, h_lo, h_hi)
-    asked_v = np.clip(asked_v, v_lo, v_hi)
-    asked_h[0] = h0
-    asked_h[-1] = h1
-    asked_v[0] = v0
-    asked_v[-1] = v1
-
-    def fn(li, lj, ah=asked_h, av=asked_v):
-        ci = np.clip(li, 0, su - 1)
-        cj = np.clip(lj, 0, sv - 1)
-        if np.ndim(li) > 0 or np.ndim(lj) > 0:
-            return ah[ci.astype(int)], av[cj.astype(int)]
-        return float(ah[int(ci)]), float(av[int(cj)])
-
-    return fn
-
-
-def _separable_inverse_target(
-    iu: int,
-    iv: int,
-    su: int,
-    sv: int,
-    spreads,
-    realized_h: np.ndarray,
-    realized_v: np.ndarray,
-    a1: float,
-    b1: float,
-    a2: float,
-    b2: float,
-    gain: float = 0.85,
-    frac_u: Optional[np.ndarray] = None,
-    frac_v: Optional[np.ndarray] = None,
-):
-    """
-    Build H(u), V(v) asked-angle maps by inverting the measured
-    column-mean / row-mean realised angles.
-
-    asked(u) = affine(target(u)) + gain * (target(u) - realised_mean(u))
-    so interior nodes that currently undershoot +V request a larger V.
-    """
-    if abs(b1) < 1e-6:
-        b1 = 1.0
-    if abs(b2) < 1e-6:
-        b2 = 1.0
-
-    tgt_h = np.zeros(su)
-    tgt_v = np.zeros(sv)
-    fu = np.asarray(frac_u, dtype=float) if frac_u is not None else None
-    fv = np.asarray(frac_v, dtype=float) if frac_v is not None else None
-    for i in range(su):
-        lu = float(fu[i]) if fu is not None else i / max(su - 1, 1)
-        tgt_h[i] = spreads.target_angles_on_facet(iu, iv, lu, 0.5)[0]
-    for j in range(sv):
-        lv = float(fv[j]) if fv is not None else j / max(sv - 1, 1)
-        tgt_v[j] = spreads.target_angles_on_facet(iu, iv, 0.5, lv)[1]
-
-    # Mean realised profile (separable)
-    real_h = np.mean(realized_h, axis=0)
-    real_v = np.mean(realized_v, axis=1)
-
-    asked_h = (tgt_h - a1) / b1 + gain * (tgt_h - real_h)
-    asked_v = (tgt_v - a2) / b2 + gain * (tgt_v - real_v)
-
-    # Keep a bounded overdrive so the surface cannot fold.
-    # Use min/max of the list.  A decreasing list such as V=(10,-10)
-    # makes tgt[0]-span / tgt[-1]+span collapse to ~[-2,+2] and the
-    # far-field squashes into two thin horizontal bands.
-    h_span = max(abs(tgt_h[-1] - tgt_h[0]), 1e-3)
-    v_span = max(abs(tgt_v[-1] - tgt_v[0]), 1e-3)
-    h_lo, h_hi = float(np.min(tgt_h)), float(np.max(tgt_h))
-    v_lo, v_hi = float(np.min(tgt_v)), float(np.max(tgt_v))
-    asked_h = np.clip(asked_h, h_lo, h_hi)
-    asked_v = np.clip(asked_v, v_lo, v_hi)
-    # Soft endpoint blend.  Hard-pinning dumped leftover +V into the last
-    # grid row; NURBS then wiped that strip and the far-field clipped ~+6°.
-    asked_h[0] = 0.35 * asked_h[0] + 0.65 * tgt_h[0]
-    asked_h[-1] = 0.35 * asked_h[-1] + 0.65 * tgt_h[-1]
-    asked_v[0] = 0.35 * asked_v[0] + 0.65 * tgt_v[0]
-    asked_v[-1] = 0.35 * asked_v[-1] + 0.65 * tgt_v[-1]
-    if su >= 3:
-        asked_h[1:-1] = 0.25 * asked_h[:-2] + 0.50 * asked_h[1:-1] + 0.25 * asked_h[2:]
-    if sv >= 3:
-        asked_v[1:-1] = 0.25 * asked_v[:-2] + 0.50 * asked_v[1:-1] + 0.25 * asked_v[2:]
-
-    def fn(li, lj, ah=asked_h, av=asked_v):
-        ci = np.clip(li, 0, su - 1)
-        cj = np.clip(lj, 0, sv - 1)
-        if np.ndim(li) > 0 or np.ndim(lj) > 0:
-            return ah[ci.astype(int)], av[cj.astype(int)]
-        return float(ah[int(ci)]), float(av[int(cj)])
-
-    return fn
-
-
-def _calibrate_facets(
-    blocks: Dict[Tuple[int, int], np.ndarray],
-    grids: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]],
-    source: np.ndarray,
-    spreads,
-    su: int,
-    sv: int,
-) -> Dict[Tuple[int, int], Tuple[float, float, float, float]]:
-    """
-    Per-facet affine calibration of the spread mapping.
-
-    Priority is matching the *boundary extrema* of the realised far-field to
-    the requested (h_min, h_max, v_min, v_max) so the spot is a hard rectangle.
-    Interior nodes are used only as a fallback when edges are degenerate.
-
-    Model:  realized ≈ a + b · target
-    Inverse map used on the next solve:  target' = (desired - a) / b
-    """
-    calib: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
-    for key, blk in blocks.items():
-        xs, ys = grids[key]
-        iu, iv = key
-        hs, vs = _realized_angles_on_block(blk, xs, ys, source)
-
-        # Requested corner angles of this facet
-        h00, v00 = spreads.target_angles_on_facet(iu, iv, 0.0, 0.0)
-        h10, v10 = spreads.target_angles_on_facet(iu, iv, 1.0, 0.0)
-        h01, v01 = spreads.target_angles_on_facet(iu, iv, 0.0, 1.0)
-        h11, v11 = spreads.target_angles_on_facet(iu, iv, 1.0, 1.0)
-        th_min = min(h00, h10, h01, h11)
-        th_max = max(h00, h10, h01, h11)
-        tv_min = min(v00, v10, v01, v11)
-        tv_max = max(v00, v10, v01, v11)
-
-        # Realised extrema on the four edges (more stable than single corners)
-        # left i=0, right i=-1, bottom j=0, top j=-1
-        rh_left = float(np.mean(hs[:, 0]))
-        rh_right = float(np.mean(hs[:, -1]))
-        rv_bot = float(np.mean(vs[0, :]))
-        rv_top = float(np.mean(vs[-1, :]))
-        rh_min = min(rh_left, rh_right)
-        rh_max = max(rh_left, rh_right)
-        rv_min = min(rv_bot, rv_top)
-        rv_max = max(rv_bot, rv_top)
-
-        def edge_fit(t_min: float, t_max: float, r_min: float, r_max: float):
-            dt = t_max - t_min
-            if abs(dt) < 1e-9:
-                return 0.0, 1.0
-            # r = a + b * t  matched at the two ends
-            b = (r_max - r_min) / dt
-            # keep a mild clip so a bad first pass cannot invert the map
-            b = float(np.clip(b, 0.4, 2.5))
-            a = r_min - b * t_min
-            return float(a), b
-
-        # Orient so that left→th_min side, right→th_max side
-        if rh_left <= rh_right:
-            ah, bh = edge_fit(th_min, th_max, rh_left, rh_right)
-        else:
-            ah, bh = edge_fit(th_min, th_max, rh_right, rh_left)
-        if rv_bot <= rv_top:
-            av, bv = edge_fit(tv_min, tv_max, rv_bot, rv_top)
-        else:
-            av, bv = edge_fit(tv_min, tv_max, rv_top, rv_bot)
-
-        calib[key] = (ah, bh, av, bv)
-    return calib
 
 
 def _shared_border_curves(
@@ -2086,979 +566,5 @@ def _shared_border_curves(
             curve[-1] = corner_val[(iu + 1, iv)]
             curves[("v", iu, iv)] = curve
     return curves
-
-
-def _ls_reconstruct_with_borders(
-    dzx: np.ndarray,
-    dzy: np.ndarray,
-    x_coords: Sequence[float],
-    y_coords: Sequence[float],
-    z_borders: Dict[str, Optional[np.ndarray]],
-) -> np.ndarray:
-    """Least-squares gradient matching with Dirichlet border rows/columns."""
-    nv, nu = dzx.shape
-    N = nv * nu
-    xs = np.asarray(x_coords, dtype=float)
-    ys = np.asarray(y_coords, dtype=float)
-
-    n_eq = nv * (nu - 1) + (nv - 1) * nu
-    A = np.zeros((n_eq, N))
-    b = np.zeros(n_eq)
-    k = 0
-    for j in range(nv):
-        for i in range(nu - 1):
-            dx = xs[i + 1] - xs[i]
-            if dx <= 0.0:
-                continue
-            A[k, j * nu + i + 1] = 1.0 / dx
-            A[k, j * nu + i] = -1.0 / dx
-            b[k] = 0.5 * (dzx[j, i] + dzx[j, i + 1])
-            k += 1
-    for j in range(nv - 1):
-        for i in range(nu):
-            dy = ys[j + 1] - ys[j]
-            if dy <= 0.0:
-                continue
-            A[k, (j + 1) * nu + i] = 1.0 / dy
-            A[k, j * nu + i] = -1.0 / dy
-            b[k] = 0.5 * (dzy[j, i] + dzy[j + 1, i])
-            k += 1
-    A = A[:k]
-    b = b[:k]
-
-    z_fixed = np.zeros(N)
-    fixed = np.zeros(N, dtype=bool)
-    for side, arr in z_borders.items():
-        if arr is None:
-            continue
-        arr = np.asarray(arr, dtype=float)
-        if side in ("left", "right"):
-            idx = 0 if side == "left" else nu - 1
-            for j in range(nv):
-                z_fixed[j * nu + idx] = arr[j]
-                fixed[j * nu + idx] = True
-        else:
-            idx = 0 if side == "bottom" else nv - 1
-            for i in range(nu):
-                z_fixed[idx * nu + i] = arr[i]
-                fixed[idx * nu + i] = True
-
-    free = ~fixed
-    if not free.any():
-        return z_fixed.reshape(nv, nu)
-
-    Am = A[:, free]
-    bm = b - (A[:, fixed] @ z_fixed[fixed])
-    sol, *_ = np.linalg.lstsq(Am, bm, rcond=None)
-    z = np.zeros(N)
-    z[fixed] = z_fixed[fixed]
-    z[free] = sol
-    return z.reshape(nv, nu)
-
-
-def _solve_facet_with_borders(
-    reflector: MFReflector,
-    ref_block,
-    spread_target,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    source: np.ndarray,
-    zb: Dict[str, Optional[np.ndarray]],
-    su: int,
-    sv: int,
-    z_step: float,
-) -> np.ndarray:
-    """Fixed-point solve of one facet with fixed border curves (+ z step)."""
-    max_iter = max(1, int(reflector.solver_iterations))
-    tol = max(0.0, float(reflector.solver_tolerance))
-    if all(arr is None for arr in zb.values()):
-        # Single-facet reflector (or fully free borders): nothing to stitch —
-        # keep the absolute pass-1 solution, only add the Z step.
-        return np.asarray(ref_block, dtype=float) + z_step
-    # Initial guess: the pass-1 block (its borders are replaced by zb below).
-    z_loc = np.asarray(ref_block, dtype=float).copy()
-    for side, arr in zb.items():
-        if arr is None:
-            continue
-        arr = np.asarray(arr, dtype=float)
-        if side in ("left", "right"):
-            idx = 0 if side == "left" else su - 1
-            z_loc[:, idx] = arr
-        else:
-            idx = 0 if side == "bottom" else sv - 1
-            z_loc[idx, :] = arr
-    h_grid, v_grid = _eval_target_grid(spread_target, su, sv)
-    xx, yy = np.meshgrid(xs, ys)
-    targets = _target_direction_from_angles(h_grid, v_grid)
-    for _ in range(max_iter):
-        dzx, dzy = _slopes_on_surface_static(xx, yy, z_loc, source, targets)
-        z_new = _ls_reconstruct_with_borders(dzx, dzy, xs, ys, zb)
-        delta = float(np.max(np.abs(z_new - z_loc)))
-        z_loc = z_new
-        if delta <= tol:
-            break
-    return z_loc + z_step
-
-
-def _bilinear_sample(grid_pts: np.ndarray, u: float, v: float) -> np.ndarray:
-    sv, su, _ = grid_pts.shape
-    ii = float(np.clip(u * (su - 1), 0, su - 1))
-    jj = float(np.clip(v * (sv - 1), 0, sv - 1))
-    i0, j0 = int(ii), int(jj)
-    i1, j1 = min(i0 + 1, su - 1), min(j0 + 1, sv - 1)
-    du, dv = ii - i0, jj - j0
-    return (
-        (1.0 - du) * (1.0 - dv) * grid_pts[j0, i0]
-        + du * (1.0 - dv) * grid_pts[j0, i1]
-        + (1.0 - du) * dv * grid_pts[j1, i0]
-        + du * dv * grid_pts[j1, i1]
-    )
-
-
-def _shrink_grid(
-    grid_pts: np.ndarray,
-    shrink_left: float = 0.0,
-    shrink_right: float = 0.0,
-    shrink_bottom: float = 0.0,
-    shrink_top: float = 0.0,
-) -> np.ndarray:
-    """
-    Shrink a facet sample grid in parameter space.
-
-    LucidShape: width/height *deltas include the gap*.  Half of each internal
-    gap is taken from each adjacent facet, so:
-      - middle facet optical width = delta - gap
-      - edge facet optical width   = delta - gap/2
-    Outer borders (no neighbour) are not shrunk.
-    """
-    if (
-        shrink_left <= 0.0
-        and shrink_right <= 0.0
-        and shrink_bottom <= 0.0
-        and shrink_top <= 0.0
-    ):
-        return grid_pts
-    sv, su, _ = grid_pts.shape
-    u0 = float(shrink_left)
-    u1 = 1.0 - float(shrink_right)
-    v0 = float(shrink_bottom)
-    v1 = 1.0 - float(shrink_top)
-    if u1 <= u0 or v1 <= v0:
-        raise ValueError("gap shrink would consume the entire facet")
-    uu = u0 + (u1 - u0) * (np.arange(su) / max(su - 1, 1))
-    vv = v0 + (v1 - v0) * (np.arange(sv) / max(sv - 1, 1))
-    ii = np.clip(uu * (su - 1), 0, su - 1)
-    jj = np.clip(vv * (sv - 1), 0, sv - 1)
-    i0 = ii.astype(int)
-    j0 = jj.astype(int)
-    i1 = np.minimum(i0 + 1, su - 1)
-    j1 = np.minimum(j0 + 1, sv - 1)
-    du = (ii - i0)[None, :, None]
-    dv = (jj - j0)[:, None, None]
-    return (
-        (1.0 - du) * (1.0 - dv) * grid_pts[j0[:, None], i0[None, :]]
-        + du * (1.0 - dv) * grid_pts[j0[:, None], i1[None, :]]
-        + (1.0 - du) * dv * grid_pts[j1[:, None], i0[None, :]]
-        + du * dv * grid_pts[j1[:, None], i1[None, :]]
-    )
-
-
-def _eval_facet(facet: Facet, u: float, v: float) -> np.ndarray:
-    from geometry.nurbs import eval_surface
-    return eval_surface(
-        facet.ctrl,
-        facet.degree_u,
-        facet.degree_v,
-        facet.knots_u,
-        facet.knots_v,
-        u,
-        v,
-    )
-
-
-def _refresh_facet_geometry(facet: Facet, source, spreads) -> None:
-    if facet.ctrl is None:
-        return
-    corners = np.array(
-        [
-            _eval_facet(facet, 0.0, 0.0),
-            _eval_facet(facet, 1.0, 0.0),
-            _eval_facet(facet, 1.0, 1.0),
-            _eval_facet(facet, 0.0, 1.0),
-        ]
-    )
-    facet.corners = corners
-    facet.center = corners.mean(axis=0)
-    facet.size_u = float(np.linalg.norm(corners[1, :2] - corners[0, :2]))
-    facet.size_v = float(np.linalg.norm(corners[3, :2] - corners[0, :2]))
-    h_min, h_max, v_min, v_max = spreads.get_facet_spread(facet.index_u, facet.index_v)
-    target = _target_direction(h_min, h_max, v_min, v_max, spreads.edge_ray)
-    facet.h_min, facet.h_max = h_min, h_max
-    facet.v_min, facet.v_max = v_min, v_max
-    facet.normal = _required_normal(source, facet.center, target)
-
-
-def _make_facet_nurbs_from_grid(
-    sub_pts: np.ndarray,
-    iu: int,
-    iv: int,
-    degree_u: int,
-    degree_v: int,
-    samples_u: int,
-    samples_v: int,
-    source,
-    spreads,
-    shrink_left: float = 0.0,
-    shrink_right: float = 0.0,
-    shrink_bottom: float = 0.0,
-    shrink_top: float = 0.0,
-    fit_method: PatchFitMethod = PatchFitMethod.EXACT,
-    uniform_parameters: bool = False,
-    patch_index_u: int = 0,
-    patch_index_v: int = 0,
-    z_step: float = 0.0,
-) -> Facet:
-    pts = _shrink_grid(
-        sub_pts, shrink_left, shrink_right, shrink_bottom, shrink_top
-    )
-    ctrl, du, dv, ku, kv = make_nurbs_from_grid(
-        pts, degree_u, degree_v, fit_method, uniform_parameters
-    )
-    corners = np.array([pts[0, 0], pts[0, -1], pts[-1, -1], pts[-1, 0]])
-    center = corners.mean(axis=0)
-    h_min, h_max, v_min, v_max = spreads.get_facet_spread(iu, iv)
-    target = _target_direction(h_min, h_max, v_min, v_max, spreads.edge_ray)
-    return Facet(
-        index_u=iu,
-        index_v=iv,
-        patch_index_u=patch_index_u,
-        patch_index_v=patch_index_v,
-        center=center,
-        normal=_required_normal(source, center, target),
-        size_u=float(np.linalg.norm(corners[1, :2] - corners[0, :2])),
-        size_v=float(np.linalg.norm(corners[3, :2] - corners[0, :2])),
-        corners=corners,
-        h_min=h_min,
-        h_max=h_max,
-        v_min=v_min,
-        v_max=v_max,
-        z_step=z_step,
-        samples_u=max(2, samples_u),
-        samples_v=max(2, samples_v),
-        is_nurbs=True,
-        ctrl=ctrl,
-        degree_u=du,
-        degree_v=dv,
-        knots_u=ku,
-        knots_v=kv,
-    )
-
-
-def _patch_ranges(n_samples: int, n_patches: int) -> List[Tuple[int, int]]:
-    n_patches = max(1, int(n_patches))
-    if n_patches == 1:
-        return [(0, n_samples)]
-    base, extra = divmod(n_samples - 1, n_patches)
-    starts = [0]
-    for i in range(n_patches):
-        starts.append(starts[-1] + base + (1 if i < extra else 0))
-    return [
-        (starts[i], starts[i + 1] + (1 if i + 1 < n_patches else 0))
-        for i in range(n_patches)
-    ]
-
-
-def _make_facet_patches(
-    sub_pts: np.ndarray,
-    iu: int,
-    iv: int,
-    degree_u: int,
-    degree_v: int,
-    source,
-    spreads,
-    shrink_left: float,
-    shrink_right: float,
-    shrink_bottom: float,
-    shrink_top: float,
-    fit_method: PatchFitMethod,
-    patches_u: int,
-    patches_v: int,
-    continuity_u: PatchContinuity,
-    continuity_v: PatchContinuity,
-    z_step: float,
-    uniform_parameters: bool,
-) -> List[Facet]:
-    use_uniform_parameters = uniform_parameters or continuity_u in (
-        PatchContinuity.TANGENT,
-        PatchContinuity.CURVATURE,
-    ) or continuity_v in (
-        PatchContinuity.TANGENT,
-        PatchContinuity.CURVATURE,
-    )
-    shrunk_pts = _shrink_grid(
-        sub_pts, shrink_left, shrink_right, shrink_bottom, shrink_top
-    )
-    ranges_u = _patch_ranges(shrunk_pts.shape[1], patches_u)
-    ranges_v = _patch_ranges(shrunk_pts.shape[0], patches_v)
-    facets: List[Facet] = []
-    for pv, (j0, j1) in enumerate(ranges_v):
-        for pu, (i0, i1) in enumerate(ranges_u):
-            facets.append(
-                _make_facet_nurbs_from_grid(
-                    shrunk_pts[j0:j1, i0:i1].copy(),
-                    iu,
-                    iv,
-                    degree_u,
-                    degree_v,
-                    max(2, i1 - i0),
-                    max(2, j1 - j0),
-                    source,
-                    spreads,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    fit_method,
-                    use_uniform_parameters,
-                    pu,
-                    pv,
-                    z_step,
-                )
-            )
-    _enforce_tangent_continuity(
-        facets,
-        len(ranges_u),
-        len(ranges_v),
-        continuity_u,
-        continuity_v,
-        source,
-        spreads,
-    )
-    return facets
-
-
-def _enforce_tangent_continuity(
-    facets: List[Facet],
-    patches_u: int,
-    patches_v: int,
-    continuity_u: PatchContinuity,
-    continuity_v: PatchContinuity,
-    source,
-    spreads,
-) -> None:
-    if patches_u <= 1 and patches_v <= 1:
-        return
-    by_patch = {(f.patch_index_u, f.patch_index_v): f for f in facets}
-
-    if continuity_u in (PatchContinuity.TANGENT, PatchContinuity.CURVATURE):
-        for pv in range(patches_v):
-            for pu in range(patches_u - 1):
-                left = by_patch[(pu, pv)]
-                right = by_patch[(pu + 1, pv)]
-                if left.ctrl.shape[1] < 2 or right.ctrl.shape[1] < 2:
-                    continue
-                shared = 0.5 * (left.ctrl[:, -1, :] + right.ctrl[:, 0, :])
-                tangent = 0.5 * (
-                    (right.ctrl[:, 1, :] - shared)
-                    + (shared - left.ctrl[:, -2, :])
-                )
-                left.ctrl[:, -1, :] = shared
-                right.ctrl[:, 0, :] = shared
-                left.ctrl[:, -2, :] = shared - tangent
-                right.ctrl[:, 1, :] = shared + tangent
-
-    if continuity_v in (PatchContinuity.TANGENT, PatchContinuity.CURVATURE):
-        for pu in range(patches_u):
-            for pv in range(patches_v - 1):
-                lower = by_patch[(pu, pv)]
-                upper = by_patch[(pu, pv + 1)]
-                if lower.ctrl.shape[0] < 2 or upper.ctrl.shape[0] < 2:
-                    continue
-                shared = 0.5 * (lower.ctrl[-1, :, :] + upper.ctrl[0, :, :])
-                tangent = 0.5 * (
-                    (upper.ctrl[1, :, :] - shared)
-                    + (shared - lower.ctrl[-2, :, :])
-                )
-                lower.ctrl[-1, :, :] = shared
-                upper.ctrl[0, :, :] = shared
-                lower.ctrl[-2, :, :] = shared - tangent
-                upper.ctrl[1, :, :] = shared + tangent
-
-    for facet in facets:
-        _refresh_facet_geometry(facet, source, spreads)
-
-def _apply_edge_delta(ctrl: np.ndarray, edge: str, delta: np.ndarray) -> np.ndarray:
-    if edge == "right":
-        weights = (1.0 - np.linspace(0.0, 1.0, ctrl.shape[1]))[None, :, None]
-    elif edge == "left":
-        weights = np.linspace(0.0, 1.0, ctrl.shape[1])[None, :, None]
-    elif edge == "top":
-        weights = (1.0 - np.linspace(0.0, 1.0, ctrl.shape[0]))[:, None, None]
-    else:
-        weights = np.linspace(0.0, 1.0, ctrl.shape[0])[:, None, None]
-    if edge in ("right", "left"):
-        return ctrl + delta[:, None, :] * weights
-    return ctrl + delta[None, :, :] * weights
-
-
-def _pair_patch_facets(facets: Sequence[Facet], key: str, value: int) -> List[Facet]:
-    return sorted(
-        [f for f in facets if getattr(f, key) == value],
-        key=lambda f: (f.patch_index_v, f.patch_index_u),
-    )
-
-
-
-def _evaluated_edge(facet: Facet, axis: str, edge: str, count: int) -> np.ndarray:
-    ts = np.linspace(0.0, 1.0, max(2, count))
-    if axis == "v":
-        return np.asarray(
-            [_eval_facet(facet, 1.0 if edge == "right" else 0.0, t) for t in ts]
-        )
-    return np.asarray(
-        [_eval_facet(facet, t, 1.0 if edge == "top" else 0.0) for t in ts]
-    )
-
-
-def _edge_control_delta(facet: Facet, axis: str, edge: str, target: np.ndarray) -> np.ndarray:
-    """Control-point delta whose evaluated edge becomes target."""
-    from geometry.nurbs import _basis_matrix
-
-    if axis == "v":
-        current = facet.ctrl[:, -1 if edge == "right" else 0, :]
-        degree = facet.degree_v
-        knots = facet.knots_v
-    else:
-        current = facet.ctrl[-1 if edge == "top" else 0, :, :]
-        degree = facet.degree_u
-        knots = facet.knots_u
-
-    params = np.linspace(0.0, 1.0, len(current))
-    matrix = _basis_matrix(params, degree, knots)
-    desired = np.linalg.lstsq(matrix, target, rcond=None)[0]
-    return desired - current
-
-
-
-def _coons_control_delta(
-    ctrl: np.ndarray,
-    left: np.ndarray,
-    right: np.ndarray,
-    bottom: np.ndarray,
-    top: np.ndarray,
-) -> np.ndarray:
-    """Blend four edge control-point deltas without destroying any edge."""
-    nv, nu, _ = ctrl.shape
-
-    # Make each corner delta unique so the Coons formula reproduces all four
-    # edge deltas exactly. Corner conflicts are resolved by averaging.
-    c00 = 0.5 * (bottom[0] + left[0])
-    c10 = 0.5 * (bottom[-1] + right[0])
-    c11 = 0.5 * (top[-1] + right[-1])
-    c01 = 0.5 * (top[0] + left[-1])
-    bottom[0], left[0] = c00, c00
-    bottom[-1], right[0] = c10, c10
-    top[-1], right[-1] = c11, c11
-    top[0], left[-1] = c01, c01
-
-    u = np.linspace(0.0, 1.0, nu)[None, :, None]
-    v = np.linspace(0.0, 1.0, nv)[:, None, None]
-    bilinear_corners = (
-        (1.0 - u) * (1.0 - v) * c00
-        + u * (1.0 - v) * c10
-        + u * v * c11
-        + (1.0 - u) * v * c01
-    )
-    return (
-        (1.0 - v) * bottom[None, :, :]
-        + v * top[None, :, :]
-        + (1.0 - u) * left[:, None, :]
-        + u * right[:, None, :]
-        - bilinear_corners
-    )
-
-
-def _apply_no_gap_borders_once(
-    facets: List[Facet],
-    n_u: int,
-    n_v: int,
-    mode: GapSurfaceMode,
-    preserve_z: bool,
-    source,
-    spreads,
-) -> None:
-    if mode not in (
-        GapSurfaceMode.NEW_BORDER,
-        GapSurfaceMode.OLD_BORDER,
-        GapSurfaceMode.AVERAGE,
-    ):
-        return
-    optical = [f for f in facets if not f.is_gap_surface]
-    edge_deltas = {
-        id(f): {"left": None, "right": None, "bottom": None, "top": None}
-        for f in optical
-    }
-
-    def sampled_edge(facet: Facet, axis: str, edge: str, count: int) -> np.ndarray:
-        return _evaluated_edge(facet, axis, edge, count)
-
-    def choose_targets(old, new, axis, old_edge_name, new_edge_name):
-        old_count = old.ctrl.shape[0] if axis == "v" else old.ctrl.shape[1]
-        new_count = new.ctrl.shape[0] if axis == "v" else new.ctrl.shape[1]
-        old_edge_for_old = sampled_edge(old, axis, old_edge_name, old_count)
-        new_edge_for_new = sampled_edge(new, axis, new_edge_name, new_count)
-        old_edge_for_new = sampled_edge(old, axis, old_edge_name, new_count)
-        new_edge_for_old = sampled_edge(new, axis, new_edge_name, old_count)
-        if mode == GapSurfaceMode.NEW_BORDER:
-            old_target = old_edge_for_old
-            new_target = old_edge_for_new
-        elif mode == GapSurfaceMode.OLD_BORDER:
-            old_target = new_edge_for_old
-            new_target = new_edge_for_new
-        else:
-            old_target = 0.5 * (old_edge_for_old + new_edge_for_old)
-            new_target = 0.5 * (old_edge_for_new + new_edge_for_new)
-        if preserve_z:
-            old_target = old_target.copy()
-            new_target = new_target.copy()
-            old_target[:, 2] = old_edge_for_old[:, 2]
-            new_target[:, 2] = new_edge_for_new[:, 2]
-        return old_target, new_target
-
-    for iu in range(n_u - 1):
-        old_group = _pair_patch_facets(optical, "index_u", iu)
-        new_group = _pair_patch_facets(optical, "index_u", iu + 1)
-        for old, new in zip(old_group, new_group):
-            old_target, new_target = choose_targets(old, new, "v", "right", "left")
-            edge_deltas[id(old)]["right"] = _edge_control_delta(
-                old, "v", "right", old_target
-            )
-            edge_deltas[id(new)]["left"] = _edge_control_delta(
-                new, "v", "left", new_target
-            )
-
-    for iv in range(n_v - 1):
-        old_group = _pair_patch_facets(optical, "index_v", iv)
-        new_group = _pair_patch_facets(optical, "index_v", iv + 1)
-        for old, new in zip(old_group, new_group):
-            old_target, new_target = choose_targets(old, new, "u", "top", "bottom")
-            edge_deltas[id(old)]["top"] = _edge_control_delta(
-                old, "u", "top", old_target
-            )
-            edge_deltas[id(new)]["bottom"] = _edge_control_delta(
-                new, "u", "bottom", new_target
-            )
-
-    for facet in optical:
-        deltas = edge_deltas[id(facet)]
-        ctrl = facet.ctrl
-        left = deltas["left"]
-        right = deltas["right"]
-        bottom = deltas["bottom"]
-        top = deltas["top"]
-        if left is None:
-            left = np.zeros((ctrl.shape[0], 3))
-        if right is None:
-            right = np.zeros((ctrl.shape[0], 3))
-        if bottom is None:
-            bottom = np.zeros((ctrl.shape[1], 3))
-        if top is None:
-            top = np.zeros((ctrl.shape[1], 3))
-        facet.ctrl = ctrl + _coons_control_delta(ctrl, left, right, bottom, top)
-
-    for facet in optical:
-        _refresh_facet_geometry(facet, source, spreads)
-
-def _apply_no_gap_borders(
-    facets: List[Facet],
-    n_u: int,
-    n_v: int,
-    mode: GapSurfaceMode,
-    preserve_z: bool,
-    source,
-    spreads,
-) -> None:
-    _apply_no_gap_borders_once(
-        facets, n_u, n_v, mode, preserve_z, source, spreads
-    )
-
-
-def _reparam_arc_length(edge: np.ndarray, n: int) -> np.ndarray:
-    """Resample a polyline edge to n points by normalised arc length."""
-    edge = np.asarray(edge, dtype=float)
-    if len(edge) == 0:
-        return edge
-    if len(edge) == 1 or n <= 1:
-        return np.repeat(edge[:1], n, axis=0)
-    seg = np.linalg.norm(np.diff(edge, axis=0), axis=1)
-    cum = np.concatenate([[0.0], np.cumsum(seg)])
-    if cum[-1] < 1e-14:
-        return np.repeat(edge[:1], n, axis=0)
-    cum /= cum[-1]
-    targets = np.linspace(0.0, 1.0, n)
-    out = np.zeros((n, 3))
-    for k, t in enumerate(targets):
-        idx = int(np.searchsorted(cum, t, side="right") - 1)
-        idx = min(max(idx, 0), len(edge) - 2)
-        t0, t1 = cum[idx], cum[idx + 1]
-        alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
-        out[k] = (1.0 - alpha) * edge[idx] + alpha * edge[idx + 1]
-    return out
-
-
-def _make_gap_surface(
-    edge_a: np.ndarray,
-    edge_b: np.ndarray,
-    samples_u: int,
-    samples_v: int,
-    degree: int = 3,
-) -> Facet:
-    """
-    One ruled NURBS face between two facing optical edges.
-
-    Degree-1 poles-on-samples used to produce a polyline strip (CATIA shows
-    every span as a separate brick).  Both rails are interpolated with a
-    shared knot vector so the loft is a single C2-along-the-seam surface
-    that still meets the sampled optical edges.
-    """
-    from geometry.nurbs import (
-        _chord_params,
-        _interpolate_curve,
-        _interpolating_knots,
-        open_uniform_knots,
-    )
-
-    n = max(2, max(len(edge_a), len(edge_b)))
-    ea = _reparam_arc_length(edge_a, n)
-    eb = _reparam_arc_length(edge_b, n)
-    deg_u = min(max(1, int(degree)), n - 1)
-    deg_v = 1
-    params = 0.5 * (_chord_params(ea) + _chord_params(eb))
-    params[0], params[-1] = 0.0, 1.0
-    knots_u = _interpolating_knots(params, deg_u)
-    ctrl_a = _interpolate_curve(ea, deg_u, params, knots_u)
-    ctrl_b = _interpolate_curve(eb, deg_u, params, knots_u)
-    ctrl = np.stack([ctrl_a, ctrl_b], axis=0)
-    knots_v = open_uniform_knots(2, deg_v)
-    corners = np.array([ea[0], ea[n - 1], eb[n - 1], eb[0]])
-    center = corners.mean(axis=0)
-    t1 = ea[n - 1] - ea[0]
-    t2 = eb[0] - ea[0]
-    nrm = np.cross(t1, t2)
-    normal = _unit(nrm) if np.linalg.norm(nrm) > 1e-12 else np.array([0.0, 0.0, 1.0])
-    return Facet(
-        index_u=-1, index_v=-1,
-        center=center, normal=normal,
-        size_u=float(np.linalg.norm(ea[n - 1] - ea[0])),
-        size_v=float(np.linalg.norm(eb[0] - ea[0])),
-        corners=corners,
-        samples_u=max(2, n),
-        samples_v=2,
-        is_nurbs=True,
-        ctrl=ctrl, degree_u=deg_u, degree_v=deg_v,
-        knots_u=knots_u, knots_v=knots_v,
-        is_gap_surface=True,
-    )
-
-
-def _make_gap_corner_surface(
-    p00: np.ndarray,
-    p10: np.ndarray,
-    p11: np.ndarray,
-    p01: np.ndarray,
-    samples_u: int,
-    samples_v: int,
-) -> Facet:
-    """Bilinear patch closing the small hole where U and V gaps intersect."""
-    from geometry.nurbs import open_uniform_knots
-
-    ctrl = np.asarray([[p00, p10], [p01, p11]], dtype=float)
-    corners = np.asarray([p00, p10, p11, p01], dtype=float)
-    center = corners.mean(axis=0)
-    normal = np.cross(p10 - p00, p01 - p00)
-    normal = _unit(normal) if np.linalg.norm(normal) > 1e-12 else np.array([0.0, 0.0, 1.0])
-    return Facet(
-        index_u=-1,
-        index_v=-1,
-        center=center,
-        normal=normal,
-        size_u=float(np.linalg.norm(p10 - p00)),
-        size_v=float(np.linalg.norm(p01 - p00)),
-        corners=corners,
-        samples_u=max(2, samples_u),
-        samples_v=max(2, samples_v),
-        is_nurbs=True,
-        ctrl=ctrl,
-        degree_u=1,
-        degree_v=1,
-        knots_u=open_uniform_knots(2, 1),
-        knots_v=open_uniform_knots(2, 1),
-        is_gap_surface=True,
-    )
-
-
-def _corner_facet(
-    facets: Sequence[Facet],
-    iu: int,
-    iv: int,
-    patch_u: int,
-    patch_v: int,
-) -> Facet:
-    return next(
-        f
-        for f in facets
-        if not f.is_gap_surface
-        and f.index_u == iu
-        and f.index_v == iv
-        and f.patch_index_u == patch_u
-        and f.patch_index_v == patch_v
-    )
-
-def generate_facets(
-    reflector: MFReflector,
-    samples_u: int | None = None,
-    samples_v: int | None = None,
-) -> List[Facet]:
-    """Generate NURBS facets and optional gap-surface connectors."""
-    grid = reflector.grid
-    spreads = reflector.spreads
-    source = reflector.source.position.copy()
-    gaps = reflector.gaps
-
-    su = max(2, samples_u if samples_u is not None else reflector.mesh_u)
-    sv = max(2, samples_v if samples_v is not None else reflector.mesh_v)
-    # Equal sample counts per sub-patch keep shared knot vectors identical,
-    # which is required for geometric (not merely control-net) continuity.
-    for patches, degree in (
-        (reflector.fit_patches_u, grid.degree_u),
-        (reflector.fit_patches_v, grid.degree_v),
-    ):
-        if patches <= 1:
-            continue
-        needed = patches * (degree + 1) + 1
-        if su < needed:
-            su = needed
-        if (su - 1) % patches:
-            su += patches - ((su - 1) % patches)
-        if sv < needed:
-            sv = needed
-        if (sv - 1) % patches:
-            sv += patches - ((sv - 1) % patches)
-    reflector.mesh_u = su
-    reflector.mesh_v = sv
-
-    n_u, n_v = grid.n_u, grid.n_v
-    degree_u, degree_v = grid.degree_u, grid.degree_v
-    x_coords, y_coords, z, su_g, sv_g, blocks = _build_height_field(reflector)
-    step_u = su_g - 1
-    step_v = sv_g - 1
-
-    gap_u = gaps.effective_gap_u()
-    gap_v = gaps.effective_gap_v()
-    if gap_u < 0 or gap_v < 0:
-        raise ValueError("gap sizes must be non-negative for gap / step-back modes")
-    use_surface = (
-        gaps.enabled
-        and gaps.gap_type in (GapType.GAP, GapType.STEP_BACK)
-        and gaps.surface_mode == GapSurfaceMode.SURFACE
-        and (gap_u > 0 or gap_v > 0)
-    )
-    no_gap_borders = gaps.gap_type in (GapType.NO_GAP, GapType.STEP_BACK_NO_GAP)
-
-    facets: List[Facet] = []
-    z_step_u = reflector.z_step_u + gaps.effective_step_z()
-    z_step_v = reflector.z_step_v + gaps.effective_step_z()
-
-    for iv in range(n_v):
-        for iu in range(n_u):
-            # Sample this facet from its own solved block: neighbours share
-            # border columns in the full z array, and the last solver would
-            # overwrite them.  Using the per-facet block keeps every facet's
-            # sample grid consistent with its own solution.
-            blk = blocks[(iu, iv)]
-            xs_b = x_coords[iu * step_u:(iu + 1) * step_u + 1]
-            ys_b = y_coords[iv * step_v:(iv + 1) * step_v + 1]
-            sub = np.asarray(
-                [[[xs_b[i], ys_b[j], blk[j, i]] for i in range(su)]
-                 for j in range(sv)],
-                dtype=float,
-            )
-            width = grid.width_deltas[iu]
-            height = grid.height_deltas[iv]
-            # deltas include gap: internal side loses gap/2, outer side loses 0
-            half_gu = (gap_u * 0.5 / width) if gap_u and width > 0 else 0.0
-            half_gv = (gap_v * 0.5 / height) if gap_v and height > 0 else 0.0
-            shrink_left = half_gu if iu > 0 else 0.0
-            shrink_right = half_gu if iu < n_u - 1 else 0.0
-            shrink_bottom = half_gv if iv > 0 else 0.0
-            shrink_top = half_gv if iv < n_v - 1 else 0.0
-            if shrink_left + shrink_right >= 1.0 - 1e-9 or shrink_bottom + shrink_top >= 1.0 - 1e-9:
-                raise ValueError(
-                    "gap size must be smaller than the facet delta; "
-                    "derived shrink would consume an entire facet"
-                )
-            z_step = iu * z_step_u + iv * z_step_v
-            if reflector.fit_patches_u == 1 and reflector.fit_patches_v == 1:
-                facets.append(
-                    _make_facet_nurbs_from_grid(
-                        sub,
-                        iu,
-                        iv,
-                        degree_u,
-                        degree_v,
-                        su,
-                        sv,
-                        source,
-                        spreads,
-                        shrink_left,
-                        shrink_right,
-                        shrink_bottom,
-                        shrink_top,
-                        reflector.patch_fit_method,
-                        uniform_parameters=no_gap_borders,
-                        z_step=z_step,
-                    )
-                )
-            else:
-                facets.extend(
-                    _make_facet_patches(
-                        sub,
-                        iu,
-                        iv,
-                        degree_u,
-                        degree_v,
-                        source,
-                        spreads,
-                        shrink_left,
-                        shrink_right,
-                        shrink_bottom,
-                        shrink_top,
-                        reflector.patch_fit_method,
-                        reflector.fit_patches_u,
-                        reflector.fit_patches_v,
-                        reflector.fit_patch_continuity_u,
-                        reflector.fit_patch_continuity_v,
-                        z_step,
-                        no_gap_borders,
-                    )
-                )
-
-    if no_gap_borders:
-        _apply_no_gap_borders(
-            facets,
-            n_u,
-            n_v,
-            gaps.surface_mode,
-            preserve_z=abs(z_step_u) > 1e-12 or abs(z_step_v) > 1e-12,
-            source=source,
-            spreads=spreads,
-        )
-
-    edge_cache: Dict[Tuple[int, int, int, int], Dict[str, np.ndarray]] = {}
-    if use_surface:
-        ts_u = np.linspace(0.0, 1.0, su)
-        ts_v = np.linspace(0.0, 1.0, sv)
-        for facet in facets:
-            if facet.is_gap_surface or facet.ctrl is None:
-                continue
-            key = (
-                facet.index_u,
-                facet.index_v,
-                facet.patch_index_u,
-                facet.patch_index_v,
-            )
-            edge_cache[key] = {
-                "left": np.asarray([_eval_facet(facet, 0.0, t) for t in ts_v]),
-                "right": np.asarray([_eval_facet(facet, 1.0, t) for t in ts_v]),
-                "bottom": np.asarray([_eval_facet(facet, t, 0.0) for t in ts_u]),
-                "top": np.asarray([_eval_facet(facet, t, 1.0) for t in ts_u]),
-            }
-
-    if use_surface:
-        if gap_u > 0:
-            for iv in range(n_v):
-                for iu in range(n_u - 1):
-                    left = sorted(
-                        [f for f in facets if not f.is_gap_surface and f.index_u == iu and f.index_v == iv],
-                        key=lambda f: f.patch_index_u,
-                    )
-                    right = sorted(
-                        [f for f in facets if not f.is_gap_surface and f.index_u == iu + 1 and f.index_v == iv],
-                        key=lambda f: f.patch_index_u,
-                    )
-                    for f_old, f_new in zip(left, right):
-                        key_old = (f_old.index_u, f_old.index_v, f_old.patch_index_u, f_old.patch_index_v)
-                        key_new = (f_new.index_u, f_new.index_v, f_new.patch_index_u, f_new.patch_index_v)
-                        gap_facet = _make_gap_surface(
-                            edge_cache[key_old]["right"],
-                            edge_cache[key_new]["left"],
-                            su,
-                            sv,
-                            degree=max(degree_u, degree_v, 3),
-                        )
-                        gap_facet.index_u = iu
-                        gap_facet.index_v = iv
-                        facets.append(gap_facet)
-        if gap_v > 0:
-            for iu in range(n_u):
-                for iv in range(n_v - 1):
-                    lower = sorted(
-                        [f for f in facets if not f.is_gap_surface and f.index_u == iu and f.index_v == iv],
-                        key=lambda f: f.patch_index_v,
-                    )
-                    upper = sorted(
-                        [f for f in facets if not f.is_gap_surface and f.index_u == iu and f.index_v == iv + 1],
-                        key=lambda f: f.patch_index_v,
-                    )
-                    for f_old, f_new in zip(lower, upper):
-                        key_old = (f_old.index_u, f_old.index_v, f_old.patch_index_u, f_old.patch_index_v)
-                        key_new = (f_new.index_u, f_new.index_v, f_new.patch_index_u, f_new.patch_index_v)
-                        gap_facet = _make_gap_surface(
-                            edge_cache[key_old]["top"],
-                            edge_cache[key_new]["bottom"],
-                            su,
-                            sv,
-                            degree=max(degree_u, degree_v, 3),
-                        )
-                        gap_facet.index_u = iu
-                        gap_facet.index_v = iv
-                        facets.append(gap_facet)
-
-        # Close the small hole at every intersection of a U gap and a V gap.
-        if gap_u > 0 and gap_v > 0:
-            max_patch_u = reflector.fit_patches_u - 1
-            max_patch_v = reflector.fit_patches_v - 1
-            for iv in range(n_v - 1):
-                for iu in range(n_u - 1):
-                    lower_left = _corner_facet(facets, iu, iv, max_patch_u, max_patch_v)
-                    lower_right = _corner_facet(facets, iu + 1, iv, 0, max_patch_v)
-                    upper_right = _corner_facet(facets, iu + 1, iv + 1, 0, 0)
-                    upper_left = _corner_facet(facets, iu, iv + 1, max_patch_u, 0)
-                    corner = _make_gap_corner_surface(
-                        _eval_facet(lower_left, 1.0, 1.0),
-                        _eval_facet(lower_right, 0.0, 1.0),
-                        _eval_facet(upper_right, 0.0, 0.0),
-                        _eval_facet(upper_left, 1.0, 0.0),
-                        su,
-                        sv,
-                    )
-                    corner.index_u = iu
-                    corner.index_v = iv
-                    facets.append(corner)
-
-    reflector.facets = facets
-    return facets
-
-
-
-
-
-
-
-
-
-
-
-
 
 

@@ -8,6 +8,7 @@ Version is maintained solely in the project __init__.py.
 
 from __future__ import annotations
 
+import logging
 import sys
 import tempfile
 import threading
@@ -24,85 +25,64 @@ try:
 except ImportError:
     HAS_TK = False
 
-try:
-    import sv_ttk
-    HAS_SV_TTK = True
-except ImportError:
-    HAS_SV_TTK = False
-
-import numpy as np
 from models import (
     MFReflector,
-    PointSource,
-    GridLayout,
-    GapsConfig,
-    SpreadsConfig,
     GapType,
     GapSurfaceMode,
     EdgeRayMode,
-    LightTargetType,
     PatchContinuity,
     PatchFitMethod,
     SolveMethod,
 )
 from geometry import generate_facets, facets_to_mesh, export_stl, export_obj, export_step
 from catia import detect_catia, import_step_to_active_part, CatiaStatus
-
-
-def _system_dpi() -> float:
-    """Logical DPI of the primary display. 96 = 100%."""
-    try:
-        import ctypes
-
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    try:
-        import ctypes
-
-        return float(ctypes.windll.user32.GetDpiForSystem())  # type: ignore[attr-defined]
-    except Exception:
-        return 96.0
-
-
-# sv-ttk 主题字体 → 字号（pt）。sv-ttk 自带的 SunValley*Font 是 11pt Segoe UI，
-# 必须整体覆盖为微软雅黑；改字号只需改这张表。
-SV_TTK_FONTS = {
-    "SunValleyBodyFont": 11,        # 正文：所有标签、输入框、下拉框
-    "SunValleyBodyStrongFont": 12,  # 加粗正文：按钮文字
-    "SunValleyBodyLargeFont": 12,   # 大号正文
-    "SunValleyCaptionFont": 10,     # 小字说明（灰色提示、单位 mm/°）
-    "SunValleySubtitleFont": 12,    # 副标题
-    "SunValleyTitleFont": 14,       # 标题
-    "SunValleyTitleLargeFont": 16,  # 大标题
-    "SunValleyDisplayFont": 18,     # 展示级大字
-}
-UI_FONT_FAMILY = "Microsoft YaHei UI"
-UI_FONT_SIZE = 12
+from ui.dialogs.fstart import open_fstart_dialog
+from ui.app_state import collect, parse_deltas
+from ui.constants import (
+    MIN_WINDOW_SIZE,
+    POLL_INTERVAL_MS,
+    STATUS_OK_COLOR,
+    TWO_COLUMN_THRESHOLD,
+    WINDOW_SIZE,
+)
+# 测试兼容 re-export（tests/test_ui.py 从本模块读取主题字体配置）
+from ui.theme import (  # noqa: F401
+    SV_TTK_FONTS,
+    UI_FONT_FAMILY,
+    UI_FONT_SIZE,
+    apply_visual_theme,
+    muted_color,
+    system_dpi,
+)
 
 
 class MFReflectorApp:
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
         self.root.title("RefLab")
-        self._dpi = _system_dpi()
+        self._dpi = system_dpi()
         self._scale = max(1.0, self._dpi / 96.0)
         try:
             self.root.tk.call("tk", "scaling", self._dpi / 72.0)
         except tk.TclError:
             pass
-        w = int(round(760 * self._scale))
-        h = int(round(520 * self._scale))
+        w, h = (int(round(v * self._scale)) for v in WINDOW_SIZE)
         self.root.geometry(f"{w}x{h}")
-        self.root.minsize(int(round(560 * self._scale)), int(round(430 * self._scale)))
+        self.root.minsize(
+            int(round(MIN_WINDOW_SIZE[0] * self._scale)),
+            int(round(MIN_WINDOW_SIZE[1] * self._scale)),
+        )
         self.reflector: Optional[MFReflector] = None
         self.catia_status: CatiaStatus = detect_catia()
         self._fstart_dialog: Optional["tk.Toplevel"] = None
         self._gen_thread: Optional["threading.Thread"] = None
         self._gen_result: tuple = (None, None)
+        self._catia_thread: Optional["threading.Thread"] = None
+        self._catia_result: tuple = (None, None)
         self._hint_labels: list = []
         self._design_columns: Optional[tuple] = None
-        self._apply_visual_theme()
+        apply_visual_theme(self.root, self._px)
+        self._hint_fg = muted_color(self.root)
         self._build_ui()
         self._refresh_catia_status()
         self._refresh_fstart_summary()
@@ -112,40 +92,20 @@ class MFReflectorApp:
     def _px(self, logical: int) -> int:
         return int(round(logical * self._scale))
 
+    # ------------------------------------------------------------------ user messages
+    def _user_error(self, title: str, text: str, parent=None) -> None:
+        """统一的用户可见错误弹窗入口：记录日志后再弹窗（文案统一化属 M2 strings.py）。"""
+        logging.getLogger(__name__).error("%s: %s", title, text)
+        messagebox.showerror(title, text, parent=parent)
+
+    def _user_warning(self, title: str, text: str, parent=None) -> None:
+        """统一的用户可见警告弹窗入口。"""
+        logging.getLogger(__name__).warning("%s: %s", title, text)
+        messagebox.showwarning(title, text, parent=parent)
+
     # ------------------------------------------------------------------ theme
     def _muted_color(self) -> str:
-        """Muted foreground matching the active theme (fallback: fixed grey)."""
-        try:
-            return self.root.tk.call(
-                "ttk::style", "lookup", "TLabel", "-foreground"
-            ) or "#5B616B"
-        except tk.TclError:
-            return "#5B616B"
-
-    def _apply_visual_theme(self) -> None:
-        if HAS_SV_TTK:
-            sv_ttk.set_theme("light")
-        # 全局字体：微软雅黑 12pt（用户指定）。
-        # 注意：sv-ttk 给 ttk 控件定义了专用 SunValley*Font（11pt Segoe UI），
-        # 只改 TkDefaultFont 等命名字体对 ttk 控件无效，必须一并覆盖。
-        import tkinter.font as tkfont
-
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            tkfont.nametofont(name).configure(family=UI_FONT_FAMILY, size=UI_FONT_SIZE)
-        for name, size in SV_TTK_FONTS.items():
-            try:
-                tkfont.Font(root=self.root, name=name, exists=True).configure(
-                    family="Microsoft YaHei UI", size=size
-                )
-            except tk.TclError:
-                pass  # 主题未加载（无 sv_ttk）时该字体不存在
-        style = ttk.Style(self.root)
-        # 紧凑控件密度：分组框留白尽量小，行距收窄，保持可用
-        style.configure("TLabelframe", padding=self._px(4))
-        style.configure("TLabelframe.Label", padding=(0, 0, 0, self._px(1)))
-        style.configure("TButton", padding=(self._px(10), self._px(3)))
-        style.configure("Accent.TButton", padding=(self._px(14), self._px(3)))
-        self._hint_fg = self._muted_color()
+        return muted_color(self.root)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -416,6 +376,17 @@ class MFReflectorApp:
         lbl.grid(row=row, column=0, columnspan=cols, sticky=tk.W, pady=(2, 0))
         self._hint_labels.append(lbl)
 
+    def _field_label(self, parent, label: str, row: int) -> None:
+        """表单行公共骨架：第 0 列放标签。"""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+
+    def _field_unit(self, parent, unit: str, row: int) -> None:
+        """表单行公共骨架：第 2 列放单位。"""
+        if unit:
+            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
+                row=row, column=2, sticky=tk.W
+            )
+
     def _add_entry(
         self,
         parent,
@@ -425,7 +396,7 @@ class MFReflectorApp:
         width: int = 14,
         unit: str = "",
     ) -> "tk.StringVar":
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        self._field_label(parent, label, row)
         if isinstance(default, tk.StringVar):
             var = default
         else:
@@ -433,10 +404,7 @@ class MFReflectorApp:
         ttk.Entry(parent, textvariable=var, width=width, justify=tk.RIGHT).grid(
             row=row, column=1, sticky=tk.W, padx=3, pady=2
         )
-        if unit:
-            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
-                row=row, column=2, sticky=tk.W
-            )
+        self._field_unit(parent, unit, row)
         return var
 
     def _add_labeled_entry(
@@ -448,7 +416,7 @@ class MFReflectorApp:
         unit: str = "",
         wide: bool = False,
     ) -> "ttk.Entry":
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        self._field_label(parent, label, row)
         entry = ttk.Entry(
             parent,
             textvariable=var,
@@ -457,9 +425,7 @@ class MFReflectorApp:
         )
         entry.grid(row=row, column=1, columnspan=2 if wide else 1, sticky=tk.W, padx=3, pady=2)
         if unit and not wide:
-            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
-                row=row, column=2, sticky=tk.W
-            )
+            self._field_unit(parent, unit, row)
         return entry
 
     def _add_pair(
@@ -471,17 +437,14 @@ class MFReflectorApp:
         row: int,
         unit: str = "",
     ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        self._field_label(parent, label, row)
         pair = ttk.Frame(parent)
         pair.grid(row=row, column=1, sticky=tk.W, padx=3, pady=2)
         ttk.Entry(pair, textvariable=var_a, width=7, justify=tk.RIGHT).pack(side=tk.LEFT)
         ttk.Entry(pair, textvariable=var_b, width=8, justify=tk.RIGHT).pack(
             side=tk.LEFT, padx=(6, 0)
         )
-        if unit:
-            ttk.Label(parent, text=unit, foreground=self._hint_fg).grid(
-                row=row, column=2, sticky=tk.W
-            )
+        self._field_unit(parent, unit, row)
 
     def _add_combobox(
         self,
@@ -491,7 +454,7 @@ class MFReflectorApp:
         default: str,
         row: int,
     ) -> "tk.StringVar":
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        self._field_label(parent, label, row)
         var = tk.StringVar(value=default)
         ttk.Combobox(
             parent, textvariable=var, values=values, state="readonly", width=16
@@ -512,7 +475,7 @@ class MFReflectorApp:
         tab = self._design_tab
         left, right = self._design_columns
         width = tab.winfo_width()
-        threshold = self._px(740)
+        threshold = self._px(TWO_COLUMN_THRESHOLD)
         adv = getattr(self, "_design_advanced", None)
         if width < threshold and width > 2:
             left.grid(row=0, column=0, columnspan=2, sticky="new", padx=0, pady=(0, 8))
@@ -580,7 +543,7 @@ class MFReflectorApp:
         footer = ttk.Frame(dialog, padding=(12, 8, 12, 12))
         footer.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Separator(footer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(footer, textvariable=status_var, foreground="#1a5f2a").pack(
+        ttk.Label(footer, textvariable=status_var, foreground=STATUS_OK_COLOR).pack(
             anchor=tk.W, pady=(0, 8)
         )
         buttons = ttk.Frame(footer)
@@ -600,133 +563,7 @@ class MFReflectorApp:
 
     # ---------------------------------------------------------------- Dialogs
     def _open_fstart_dialog(self) -> None:
-        if self._fstart_dialog is not None and self._fstart_dialog.winfo_exists():
-            self._fstart_dialog.lift()
-            self._fstart_dialog.focus_force()
-            return
-
-        dialog = tk.Toplevel(self.root)
-        self._fstart_dialog = dialog
-        dialog.title("F.Start")
-        dialog.transient(self.root)
-        dialog.minsize(self._px(460), self._px(420))
-        dialog.geometry(f"{self._px(520)}x{self._px(620)}")
-        dialog.resizable(True, True)
-        dialog.grab_set()
-
-        d_use_start = tk.BooleanVar(value=self.use_start_point.get())
-        d_start_x = tk.StringVar(value=self.start_x.get())
-        d_start_y = tk.StringVar(value=self.start_y.get())
-        d_start_auto = tk.BooleanVar(value=self.start_auto.get())
-        d_calc_u = tk.StringVar(value=self.calc_start_u.get())
-        d_calc_v = tk.StringVar(value=self.calc_start_v.get())
-        d_ref_u = tk.StringVar(value=self.reference_u.get())
-        d_ref_v = tk.StringVar(value=self.reference_v.get())
-        d_neighbor = tk.BooleanVar(value=self.use_neighbor_curve.get())
-        d_z_u = tk.StringVar(value=self.z_step_u.get())
-        d_z_v = tk.StringVar(value=self.z_step_v.get())
-        status = tk.StringVar(value="Not applied — click Apply to send into Generate.")
-
-        def apply_fstart() -> bool:
-            try:
-                sx = float(d_start_x.get())
-                sy = float(d_start_y.get())
-                cu = float(d_calc_u.get())
-                cv = float(d_calc_v.get())
-                ru = float(d_ref_u.get())
-                rv = float(d_ref_v.get())
-                zu = float(d_z_u.get())
-                zv = float(d_z_v.get())
-            except ValueError:
-                messagebox.showerror(
-                    "F.Start",
-                    "All numeric fields must be valid numbers.",
-                    parent=dialog,
-                )
-                return False
-            if d_use_start.get():
-                try:
-                    x0, x1, y0, y1 = self._aperture_bounds()
-                except Exception as exc:
-                    messagebox.showerror("F.Start", f"Cannot read the grid: {exc}", parent=dialog)
-                    return False
-                pad = 1e-9
-                if not (x0 - pad <= sx <= x1 + pad and y0 - pad <= sy <= y1 + pad):
-                    messagebox.showerror(
-                        "F.Start",
-                        f"Start ({sx:.3f}, {sy:.3f}) is outside the aperture\n"
-                        f"X {x0:.1f}…{x1:.1f}, Y {y0:.1f}…{y1:.1f}.",
-                        parent=dialog,
-                    )
-                    return False
-            self.use_start_point.set(d_use_start.get())
-            self.start_x.set(f"{sx:g}")
-            self.start_y.set(f"{sy:g}")
-            self.start_auto.set(d_start_auto.get())
-            self.calc_start_u.set(f"{cu:g}")
-            self.calc_start_v.set(f"{cv:g}")
-            self.reference_u.set(f"{ru:g}")
-            self.reference_v.set(f"{rv:g}")
-            self.use_neighbor_curve.set(d_neighbor.get())
-            self.z_step_u.set(f"{zu:g}")
-            self.z_step_v.set(f"{zv:g}")
-            self._refresh_fstart_summary()
-            if d_use_start.get():
-                status.set(f"Applied — start ({sx:g}, {sy:g}). Generate to rebuild.")
-            else:
-                status.set("Applied — global start off, using U/V. Generate to rebuild.")
-            return True
-
-        self._dialog_action_bar(dialog, apply_fstart, status)
-
-        body = ttk.Frame(dialog, padding=(12, 12, 12, 0))
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        body.columnconfigure(0, weight=1)
-
-        grid_group = ttk.LabelFrame(body, text="Grid Start Point", padding=8)
-        grid_group.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Checkbutton(
-            grid_group, text="使用全局起点", variable=d_use_start
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(grid_group, "Start X", d_start_x, 1, unit="mm")
-        self._add_entry(grid_group, "Start Y", d_start_y, 2, unit="mm")
-        try:
-            x0, x1, y0, y1 = self._aperture_bounds()
-            bounds = (
-                f"须落在当前孔径内：X {x0:.1f}…{x1:.1f}，Y {y0:.1f}…{y1:.1f}。"
-                f"中心 ({0.5 * (x0 + x1):.1f}, {0.5 * (y0 + y1):.1f})。"
-            )
-        except Exception:
-            bounds = "须落在设计页的孔径范围内。"
-        ttk.Label(grid_group, text=bounds, wraplength=self._px(450), justify=tk.LEFT).grid(
-            row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0)
-        )
-
-        calc_group = ttk.LabelFrame(body, text="Facet Calculation Start", padding=8)
-        calc_group.grid(row=1, column=0, sticky=tk.EW, pady=(10, 0))
-        ttk.Checkbutton(
-            calc_group, text="自动（使用参考点）", variable=d_start_auto
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(calc_group, "Start U", d_calc_u, 1)
-        self._add_entry(calc_group, "Start V", d_calc_v, 2)
-        self._add_entry(calc_group, "Reference U", d_ref_u, 3)
-        self._add_entry(calc_group, "Reference V", d_ref_v, 4)
-
-        neighbor_group = ttk.LabelFrame(body, text="Boundary & Z Steps", padding=8)
-        neighbor_group.grid(row=2, column=0, sticky=tk.EW, pady=(10, 0))
-        ttk.Checkbutton(
-            neighbor_group, text="使用邻边基线", variable=d_neighbor
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        self._add_entry(neighbor_group, "Z step U", d_z_u, 1, unit="mm")
-        self._add_entry(neighbor_group, "Z step V", d_z_v, 2, unit="mm")
-        ttk.Label(
-            neighbor_group,
-            text="关：只在参考点对齐，光学展开保持设定范围。开：共享边水密，接缝附近光学会弯。",
-            wraplength=self._px(450),
-            justify=tk.LEFT,
-        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
-
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        open_fstart_dialog(self)
 
     # ------------------------------------------------------------------ CATIA
     def _refresh_catia_status(self) -> None:
@@ -750,88 +587,12 @@ class MFReflectorApp:
         return vals[:n]
 
     def _collect(self) -> MFReflector:
-        n_u = max(1, int(self.n_u.get()))
-        n_v = max(1, int(self.n_v.get()))
-        degree_u = max(1, int(self.degree_u.get()))
-        degree_v = max(1, int(self.degree_v.get()))
-        width_deltas = self._parse_deltas(self.width_deltas.get(), n_u)
-        height_deltas = self._parse_deltas(self.height_deltas.get(), n_v)
-        offset_x = float(self.offset_x.get())
-        offset_y = float(self.offset_y.get())
-        start_z = float(self.start_z.get())
+        return collect(self)
 
-        calculation_start_u = (
-            None if self.start_auto.get() else float(self.calc_start_u.get())
-        )
-        calculation_start_v = (
-            None if self.start_auto.get() else float(self.calc_start_v.get())
-        )
-        gap_type = GapType(self.gap_type.get())
-        step_z = 0.0
-
-        return MFReflector(
-            name="UI_Reflector",
-            source=PointSource(
-                position=np.array([
-                    float(self.src_x.get()),
-                    float(self.src_y.get()),
-                    float(self.src_z.get()),
-                ]),
-                pattern=str(self.src_pattern.get()),
-                lambert_n=float(self.src_lambert_n.get()),
-                axis=None if self.src_axis_auto.get() else np.array([
-                    float(self.src_axis_x.get()),
-                    float(self.src_axis_y.get()),
-                    float(self.src_axis_z.get()),
-                ]),
-            ),
-            grid=GridLayout(
-                n_u=n_u,
-                n_v=n_v,
-                width_deltas=width_deltas,
-                height_deltas=height_deltas,
-                offset_x=offset_x,
-                offset_y=offset_y,
-                start_z=start_z,
-                focal=float(self.focal.get()),
-                degree_u=degree_u,
-                degree_v=degree_v,
-                use_start_point=self.use_start_point.get(),
-                start_point=np.array([float(self.start_x.get()), float(self.start_y.get())]),
-            ),
-            gaps=GapsConfig(
-                enabled=True,
-                gap_type=gap_type,
-                surface_mode=GapSurfaceMode(self.gap_mode.get()),
-                size_u=float(self.gap_u.get()),
-                size_v=float(self.gap_v.get()),
-                size_z=step_z,
-            ),
-            spreads=SpreadsConfig(
-                light_target=LightTargetType.FAR_FIELD,
-                edge_ray=EdgeRayMode(self.edge_ray.get()),
-                h_angles=self.spread_h.get(),
-                v_angles=self.spread_v.get(),
-                uniform_intensity=bool(self.uniform_intensity.get()),
-            ),
-            solve=SolveMethod(self.solve.get()),
-            mesh_u=max(2, int(self.samples.get())),
-            mesh_v=max(2, int(self.samples.get())),
-            solver_iterations=max(1, int(self.solver_iterations.get())),
-            solver_tolerance=float(self.solver_tolerance.get()),
-            calculation_start_u=calculation_start_u,
-            calculation_start_v=calculation_start_v,
-            reference_position_u=float(self.reference_u.get()),
-            reference_position_v=float(self.reference_v.get()),
-            use_base_curve_from_neighbor=self.use_neighbor_curve.get(),
-            z_step_u=float(self.z_step_u.get()),
-            z_step_v=float(self.z_step_v.get()),
-            patch_fit_method=PatchFitMethod(self.patch_method.get()),
-            fit_patches_u=max(1, int(self.fit_patches_u.get())),
-            fit_patches_v=max(1, int(self.fit_patches_v.get())),
-            fit_patch_continuity_u=PatchContinuity(self.continuity_u.get()),
-            fit_patch_continuity_v=PatchContinuity(self.continuity_v.get()),
-        )
+    @staticmethod
+    def _parse_deltas(text: str, n: int, fallback: float = 10.0) -> list:
+        """逗号分隔的尺寸列表 → 长度为 n 的列表（不足重复末值）。"""
+        return parse_deltas(text, n, fallback)
 
     def on_apply(self) -> None:
         # 后台线程执行生成，避免大网格时冻结 UI。结果经 _poll_generation 落地。
@@ -841,7 +602,7 @@ class MFReflectorApp:
         try:
             self.reflector = self._collect()
         except Exception as exc:
-            messagebox.showerror("生成失败", str(exc))
+            self._user_error("生成失败", str(exc))
             self.status.config(text="生成失败。")
             return
         self._set_busy(True)
@@ -858,7 +619,7 @@ class MFReflectorApp:
 
         self._gen_thread = threading.Thread(target=work, daemon=True)
         self._gen_thread.start()
-        self.root.after(50, self._poll_generation)
+        self.root.after(POLL_INTERVAL_MS, self._poll_generation)
 
     def _set_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
@@ -868,62 +629,35 @@ class MFReflectorApp:
     def _poll_generation(self) -> None:
         thread = self._gen_thread
         if thread is not None and thread.is_alive():
-            self.root.after(50, self._poll_generation)
+            self.root.after(POLL_INTERVAL_MS, self._poll_generation)
             return
         msg, err = self._gen_result
         self._gen_thread = None
         self._gen_result = (None, None)
         self._set_busy(False)
         if err is not None:
-            messagebox.showerror("生成失败", str(err))
+            self._user_error("生成失败", str(err))
             self.status.config(text="生成失败。")
         else:
             self.status.config(text=msg)
 
-    def _wait_for_generation(self, timeout: float = 120.0) -> None:
-        """测试/脚本辅助：泵事件循环直到后台生成结束。"""
-        import time as _time
-
-        deadline = _time.time() + timeout
-        while self._gen_thread is not None and self._gen_thread.is_alive():
-            if _time.time() >= deadline:
-                raise TimeoutError("generation did not finish in time")
-            try:
-                self.root.update()
-            except tk.TclError:
-                break
-            _time.sleep(0.01)
-        # 再泵几轮让 after 回调把结果与按钮状态落地
-        for _ in range(20):
-            try:
-                self.root.update()
-            except tk.TclError:
-                break
-            if self._gen_thread is None:
-                break
-            _time.sleep(0.01)
+    def _export_mesh(self, suffix: str, exporter) -> None:
+        if not self._ensure_generated():
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=suffix,
+            filetypes=[(suffix[1:].upper(), f"*{suffix}")],
+        )
+        if path:
+            vertices, faces = facets_to_mesh(self.reflector.facets)
+            exporter(vertices, faces, path)
+            self.status.config(text=f"已保存 {path}")
 
     def on_export_stl(self) -> None:
-        if not self._ensure_generated():
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".stl", filetypes=[("STL", "*.stl")]
-        )
-        if path:
-            vertices, faces = facets_to_mesh(self.reflector.facets)
-            export_stl(vertices, faces, path)
-            self.status.config(text=f"已保存 {path}")
+        self._export_mesh(".stl", export_stl)
 
     def on_export_obj(self) -> None:
-        if not self._ensure_generated():
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".obj", filetypes=[("OBJ", "*.obj")]
-        )
-        if path:
-            vertices, faces = facets_to_mesh(self.reflector.facets)
-            export_obj(vertices, faces, path)
-            self.status.config(text=f"已保存 {path}")
+        self._export_mesh(".obj", export_obj)
 
     def on_export_step(self) -> None:
         if not self._ensure_generated():
@@ -936,11 +670,15 @@ class MFReflectorApp:
                 n = export_step(self.reflector.facets, path, include_gap_surfaces=True)
                 self.status.config(text=f"STEP 已保存（{n} 面）：{path}")
             except Exception as exc:
-                messagebox.showerror("STEP 导出失败", str(exc))
+                self._user_error("STEP 导出失败", str(exc))
 
     def on_send_catia(self) -> None:
+        """后台线程发送（COM 慢且可能卡；bridge._get_catia 已在工作线程内 CoInitialize）。"""
         if self._gen_thread is not None and self._gen_thread.is_alive():
             self.status.config(text="正在生成…完成后再发送到 CATIA。")
+            return
+        if self._catia_thread is not None and self._catia_thread.is_alive():
+            self.status.config(text="正在发送到 CATIA…请等待完成。")
             return
         if not self.reflector or not self.reflector.is_generated():
             self.on_apply()
@@ -948,24 +686,46 @@ class MFReflectorApp:
             return
         self._refresh_catia_status()
         if not self.catia_status.can_send:
-            messagebox.showwarning("CATIA", self.catia_status.message)
+            self._user_warning("CATIA", self.catia_status.message)
             return
-        try:
-            with tempfile.TemporaryDirectory(prefix="mf_reflector_") as temp_dir:
-                tmp = Path(temp_dir) / "reflector.stp"
-                export_step(self.reflector.facets, str(tmp), include_gap_surfaces=True)
-                result = import_step_to_active_part(tmp, body_name="MF_Reflector")
+        self._set_busy(True)
+        self.status.config(text="正在发送到 CATIA…")
+
+        def work():
+            try:
+                with tempfile.TemporaryDirectory(prefix="mf_reflector_") as temp_dir:
+                    tmp = Path(temp_dir) / "reflector.stp"
+                    export_step(self.reflector.facets, str(tmp), include_gap_surfaces=True)
+                    result = import_step_to_active_part(tmp, body_name="MF_Reflector")
+                self._catia_result = (result, None)
+            except Exception as exc:
+                self._catia_result = (None, exc)
+
+        self._catia_thread = threading.Thread(target=work, daemon=True)
+        self._catia_thread.start()
+        self.root.after(POLL_INTERVAL_MS, self._poll_catia)
+
+    def _poll_catia(self) -> None:
+        thread = self._catia_thread
+        if thread is not None and thread.is_alive():
+            self.root.after(POLL_INTERVAL_MS, self._poll_catia)
+            return
+        result, err = self._catia_result
+        self._catia_thread = None
+        self._catia_result = (None, None)
+        self._set_busy(False)
+        if err is not None:
+            self._user_error("CATIA", str(err))
+            self.status.config(text="CATIA 发送失败。")
+        elif result is not None and result.ok:
             self.status.config(text=result.message)
-            if result.ok:
-                messagebox.showinfo("CATIA", result.message)
-            else:
-                messagebox.showerror("CATIA", result.message)
-        except Exception as exc:
-            messagebox.showerror("CATIA", str(exc))
+        elif result is not None:
+            self._user_error("CATIA", result.message)
+            self.status.config(text=result.message)
 
     def _ensure_generated(self) -> bool:
         if not self.reflector or not self.reflector.is_generated():
-            messagebox.showwarning("提示", "请先生成反射面。")
+            self._user_warning("提示", "请先生成反射面。")
             return False
         return True
 

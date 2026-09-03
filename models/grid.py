@@ -7,7 +7,7 @@ Supports both uniform size and variable width_deltas / height_deltas (params.py 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 import numpy as np
 
 from .enums import GridType, GridShapeMode, EdgeShape

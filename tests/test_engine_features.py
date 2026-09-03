@@ -10,6 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
+import pytest
+
+import logging
 
 from models import (
     EdgeRayMode,
@@ -140,6 +143,17 @@ def test_step_back_no_gap_applies_z_steps():
     reflector.gaps.size_z = 0.3
     facets = generate_facets(reflector)
     assert [round(f.z_step, 12) for f in facets] == [0.0, 0.3, 0.6]
+
+
+def test_unsupported_light_target_raises():
+    """引擎只实现远场目标：其余 light_target 取值必须显式报错，不得静默按远场处理。"""
+    from models.enums import LightTargetType
+    from geometry.engine import _build_height_field
+
+    r = _reflector(1, 1)
+    r.spreads.light_target = LightTargetType.NEAR_Z_PLANE
+    with pytest.raises(NotImplementedError, match="light_target"):
+        _build_height_field(r)
 
 
 def test_uniform_intensity_off_matches_legacy():
@@ -308,6 +322,24 @@ def test_no_gap_borders_close_in_both_u_and_v():
         old_edge = np.asarray([_eval_facet(old, t, 1.0) for t in ts])
         new_edge = np.asarray([_eval_facet(new, t, 0.0) for t in ts])
         assert np.max(np.abs(old_edge - new_edge)) < 1e-3
+def test_invalid_jobs_env_warns(monkeypatch, caplog):
+    """MF_REFLECTOR_JOBS 非法值必须发出警告而不是静默忽略。"""
+    from geometry.parallel import _facet_worker_count
+
+    monkeypatch.setenv("MF_REFLECTOR_JOBS", "not-a-number")
+    with caplog.at_level(logging.WARNING, logger="geometry.parallel"):
+        n = _facet_worker_count(4)
+    assert n >= 1
+    assert any("MF_REFLECTOR_JOBS" in r.message for r in caplog.records)
+
+
+def test_valid_jobs_env_respected(monkeypatch):
+    from geometry.parallel import _facet_worker_count
+
+    monkeypatch.setenv("MF_REFLECTOR_JOBS", "2")
+    assert _facet_worker_count(8) == 2
+
+
 if __name__ == "__main__":
     test_start_point_and_per_facet_solver()
     test_gap_surface_and_empty_modes()

@@ -75,6 +75,7 @@ class SpreadsConfig:
       - (-20, 20)           → linear -20° … 20° across the facet
       - (0, 5, 10, 15, 20) → piecewise, even parameter steps
       - (-20, -10, 20)     → piecewise interpolation
+      - 长度为 1 的列表与空列表一样回退到 ±global/2
 
     When lists are empty, fall back to symmetric global_h_deg / global_v_deg.
     """
@@ -126,7 +127,14 @@ class SpreadsConfig:
     ) -> Tuple[List[float], List[float]]:
         """Return (h_list, v_list) for facet (i_u, i_v)."""
         if self.per_facet is not None:
-            entry = self.per_facet[i_v][i_u]
+            try:
+                entry = self.per_facet[i_v][i_u]
+            except IndexError as exc:
+                raise IndexError(
+                    f"per_facet 表尺寸与网格不符：需要 [n_v][n_u] 条目，"
+                    f"访问 [{i_v}][{i_u}] 失败（表形状 "
+                    f"{len(self.per_facet)}x{len(self.per_facet[0])}）"
+                ) from exc
             # Support both (h_list, v_list) and (hmin,hmax,vmin,vmax)
             if len(entry) == 2 and isinstance(entry[0], (list, tuple)):
                 return list(entry[0]), list(entry[1])

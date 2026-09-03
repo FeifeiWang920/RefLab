@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List
-import numpy as np
 
 from .source import PointSource
 from .grid import GridLayout
@@ -32,6 +31,7 @@ class MFReflector:
     grid: GridLayout = field(default_factory=GridLayout)
     gaps: GapsConfig = field(default_factory=GapsConfig)
     spreads: SpreadsConfig = field(default_factory=SpreadsConfig)
+    # 未参与几何求解（几何形状与反射率无关）；能量仿真不在本项目范围。TODO: 若做能量核算需接入
     reflection_coefficient: float = 1.0
 
     # Integration order (params.py: solve)

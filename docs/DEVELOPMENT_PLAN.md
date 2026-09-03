@@ -63,97 +63,79 @@
 
 ### 4.1 打包与依赖
 
-- [ ] **pyproject.toml**：声明项目元数据、`requires-python = ">=3.9"`、`[project.scripts] mf-reflector = "main:main"`（或迁移入口到包内模块）；`__init__.py` 通过 `importlib.metadata.version()` 读取版本。
-- [ ] **可选依赖分组**：`step = ["cadquery"]`、`catia = ["pywin32"]`、`dev = ["pytest", "ruff", "mypy"]`。当前 `requirements.txt:14-15` 注释掉 pywin32 但 `catia/bridge.py:56,63-64` 硬依赖 win32com，声明与实际不符。
-- [ ] **可复现性**：requirements 全部 `>=` 无锁定，numba↔numpy 兼容窗口尤其敏感。提供 `constraints.txt`。
-- [ ] **根目录 `__init__.py`**：在无打包现状下制造「仓库根是包」的错觉且 import 时连锁拉起 models/geometry；随 pyproject 落地迁入 `src/mf_reflector/__init__.py`（或删除）。
+- [x] **pyproject.toml**：元数据、`requires-python = ">=3.9"`、`[project.scripts] reflab = "main:main"`、`[tool.pytest.ini_options]`、ruff/mypy 宽松配置。版本 0.9.7 以 pyproject 为单一来源；`main.py` 启动时经 importlib.metadata 输出版本。`pip install -e ".[dev]"` 已验证可用（2026-09-03）。
+- [x] **可选依赖分组**：`step = ["cadquery"]`、`catia = ["pywin32; sys_platform == 'win32'"]`、`dev = ["pytest", "ruff"]`，与实际依赖对齐。
+- [x] **可复现性**：新增 `constraints.txt`（Windows 11 / Python 3.13.5 验证组合）。
+- [x] **根目录 `__init__.py`**：已删除（M0 完成，同时修复 pytest 9 收集失败）。
 
 ### 4.2 CI 与质量门
 
-- [ ] **GitHub Actions**：Windows 跑全量（含 STEP/CATIA mock），Linux 跑可跳过子集；黄金基线测试必须在每次 push 运行。
-- [ ] **最小 pytest 配置**（pytest.ini 或 pyproject `[tool.pytest.ini_options]`）；加 `tests/conftest.py` 注入仓库根到 sys.path，替代散落各处的样板。
-- [ ] **Ruff + mypy（宽松起步）**：清理 Django/Flask/Scrapy 残留的 .gitignore 模板段（`*.log` 藏在 "# Django stuff" 下、`*.stp/*.stl/*.obj` 扩展名规则会连带吞掉用户想提交的样例文件），同时补 `.claude/` 忽略。
+- [x] **GitHub Actions**（`.github/workflows/ci.yml`）：Windows 全量安装（step+catia extras）、Linux 核心 extras（可跳过子集），ruff 门禁 + pytest；win/ubuntu × py3.12/3.13 矩阵。
+- [x] **pytest 配置**：pyproject `[tool.pytest.ini_options]`（testpaths + -q）；`tests/conftest.py` 注入仓库根。
+- [x] **Ruff（宽松起步）**：`select = [E,F,W]` + per-file-ignores（E402 为 sys.path 引导惯例、engine 的物理符号 I 与待 M2 清理的 F841）；现存告警已清零。mypy 配置占位已写入 pyproject（不作为 CI 门禁）。
+- [x] **.gitignore 裁剪**：移除 Django/Flask/Scrapy 等模板残留，分组注释，补 `.claude/`。
 
 ### 4.3 日志与错误处理
 
-- [ ] **引入 logging 替代 print**：全仓库目前无 `import logging`。
-- [ ] **STEP 导出静默失败**（`geometry/step_export.py:83,205`）：BSpline/MakeFace 失败只 print 后继续，用户拿到缺面 STEP 无任何告警——改为 logging.warning 并在返回值中报告跳过面数。
-- [ ] **mesh_export 静默退化**（`mesh_export.py:29-31`）：网格点数不匹配时退化为两三角形导出——至少 `warnings.warn` 并附 facet 索引。
-- [ ] **catia/bridge 的 5 处 `except Exception: pass`**（168,177,214,430,440 附近）：至少 `logging.debug` 记录异常，COM 失败才可诊断。
-- [ ] **统一用户可见错误入口**：中文标题配英文正文（`ui/main_window.py:639-643` 等）。做一个 `_user_error(title, text)` 辅助，统一语言与日志。
-- [ ] **`MF_REFLECTOR_JOBS` 非法值静默忽略**（`engine.py:35-38`）：打一条 warning。
+- [x] **logging 替代 print**：main.py basicConfig + 版本输出；engine/step_export/mesh_export/bridge/ui 各自模块 logger。
+- [x] **STEP 导出静默失败**：print → logging.warning，并统计跳过面数、汇总告警（保持 int 返回值不破坏 API）。
+- [x] **mesh_export 静默退化**：`warnings.warn` 附 facet 索引。
+- [x] **bridge 关键 `except Exception: pass`**：6 处改 `logger.debug`（选择/命名/关闭/粘贴/Update 路径）。
+- [x] **统一用户可见错误入口**：`_user_error` / `_user_warning`（日志 + 弹窗），11 处调用点收口；文案翻译属 M2 strings.py。
+- [x] **`MF_REFLECTOR_JOBS` 非法值**：`logger.warning`（含 caplog 回归测试）。
 
 ### 4.4 行为修正（属 bug，优先修）
 
-- [ ] **`detect_catia()` 探测可能拉起 CATIA 进程**：`ui/main_window.py:97` 构造函数即探测，而 `catia/bridge.py:69-71` 的 `Dispatch("CATIA.Application")` 回退会启动新的 CATIA。探测阶段只用 `GetActiveObject`，`Dispatch` 留给显式「发送」动作。
-- [ ] **CATIA 发送在 UI 线程执行**（`ui/main_window.py:939-962`）：大模型时界面冻结。复用 `_gen_thread` 同款后台 worker 模式。
+- [x] **`detect_catia()` 探测不再拉起 CATIA**：`_get_catia(allow_launch=False)` 默认仅 GetActiveObject；Dispatch 仅显式发送路径（`allow_launch=True`）。测试：`test_detect_catia_never_launches`（断言探测路径零次 Dispatch）。
+- [x] **CATIA 发送后台线程化**：worker + `after` 轮询（复用生成线程模式）；发送期间按钮禁用、生成/发送互斥；成功仅写状态栏不再弹模态。bridge 的 `_get_catia` 已在工作线程内 `CoInitialize`。测试：`test_send_catia_runs_in_background`。
 
 ---
 
 ## 5. M2 —— 架构重构（P1，分步提交）
 
-### 5.1 geometry/engine.py（约 3000 行）
+### 5.1 geometry/engine.py（约 3000 行）—— ✅ 全部完成（2026-09-03，每步黄金基线验证）
 
-按下列顺序独立提交，每步跑黄金基线：
+1. [x] **删除约 600 行死代码**：AST 可达性分析定位 22 个死函数 / 597 行，删除后全量测试 + 黄金基线通过。
+2. [x] **合并重复实现**：`_realized_angles_on_block` 复用 `_height_slopes`；`_ls_reconstruct_with_borders` 并入 `_SlopeHeightSolver.for_borders` 后删除；1-D 查表闭包统一为 `_table_target_fn`（修复了半成品递归 bug + 恢复被误删的 `_row_h_preemphasis`——黄金基线拦截了一次行为变更）；`_polish_farfield_rectangle` 的 `flux` 死参数删除；UI STL/OBJ 合并为 `_export_mesh`。
+3. [x] **魔法数字常量化** → `geometry/tuning.py`（14 个命名常量，覆盖混合权重/gain 调度/抛光/预加重/能量映射/可分离逆问题）。
+4. [x] **拆分长函数**：`_build_height_field` 327 行 → 编排器 ~65 行 + `_subgrid_coords/_plan_facets/_pass_absolute/_pass_affine/_pass_inverse/_polish_energy_blocks/_pass_stitch`；`generate_facets` → `_ensure_patch_samples/_add_gap_surfaces` + 装配编排。
+5. [x] **管线状态整理**：`HeightField/_GridCtx/_EnergyCtx` NamedTuple（6 元组返回值具名化，位置解包兼容）；`solved`/`blocks` 双份拷贝合并；`cal_blocks` 按阶段命名（abs→cal→inv 由函数边界天然区分）。
+6. [x] **模块化拆分**：`geometry/` 现为 parallel(39)/mathutils(157)/flux(186)/reconstruction(253)/solve(590)/facets(863)/tuning(40)/engine(564 门面)；`generate_facets` 经门面延迟转发避免循环依赖；测试引用的私有符号全部 re-export。
 
-1. **删除约 600 行死代码**（占文件 20%，全仓库零引用或仅被死代码引用）：
-   位于 engine.py 的 87, 144, 333, 368, 411, 465, 543, 590, 671, 694, 708, 854, 1274, 1368, 1503, 1511, 1569, 1608, 1808, 2202, 2489 行起始的函数（含传递性死亡的 `_match_border_slopes`、`_intensity_scale_field`、`_reach_rectangle_on_surface`）。验收：`pytest tests/ -q` 全绿 + 黄金基线不变。
-2. **合并重复实现**：
-   - `_realized_angles_on_block` 内部（1535-1550）逐字复制了 `_height_slopes`（171-189）——直接复用；
-   - `_ls_reconstruct_with_borders`（2090-2155）与 `_SlopeHeightSolver` 是同一设计矩阵两套实现——给后者加 border 约束参数后删除前者；
-   - 6 处几乎相同的 1-D 查表闭包（381, 451, 1759, 1795, 1894, 1971）——提取统一 `TargetTable` 类；
-   - `_polish_farfield_rectangle` 的 `flux` 参数从未使用（1424），调用方还专门算了一次通量（1122）——删参数与调用方计算；
-   - STL/OBJ 导出两方法 9 行近乎复制（`ui/main_window.py:904-924`）——合并。
-3. **魔法数字常量化** → 新建 `geometry/tuning.py`：路径-LS 混合 0.35/0.65（1493）、逆问题轮次与 gain 调度（1069-1071, 1441-1445）、clamp 区间（1791, 1593-1605, 318-329, 2033）、直方图 bin 数、`edge_weight=2.5` 四处双默认（765, 782, 862, 1479）等。
-4. **拆分长函数**：`_build_height_field`（325 行）→ 6 个阶段函数（子网格/种子/绝对求解/仿射校准/逆迭代/缝边）；`generate_facets`（234 行）→ patch 采样调整 + 面片装配 + gap 面 + 补洞，并把「直接改写 `reflector.mesh_u/mesh_v`、`reflector.facets`」的隐藏副作用改为显式返回。
-5. **管线状态整理**：`acc_calib` 死初始化（1032-1037）、`cal_blocks` 同名三义（1031/1062/1112）、`solved`/`blocks` 双份拷贝（1202-1203）；6 元组返回值改 NamedTuple。
-6. **模块化拆分**（见附录 A 的 7 文件方案），`engine.py` 退化为门面并 re-export 测试引用的私有符号（已核实 `tests/test_engine_features.py:173-249` 依赖 6 个私有符号，门面可保持测试不动）。
+### 5.2 ui/main_window.py（约 980 行）—— 结构项完成 4/5（2026-09-03）
 
-### 5.2 ui/main_window.py（约 980 行）
-
-- [ ] **拆分上帝类**（9 种职责混在一起）：
-  ```
-  ui/
-  ├── theme.py          # sv-ttk 应用、字体表、muted 色（现 50-146 行）
-  ├── constants.py      # 窗口 760×520/最小 560×430、对话框尺寸、阈值 740px、
-  │                     #   轮询 50ms、超时 120s、颜色字面量 #5B616B/#1a5f2a
-  ├── strings.py        # 全部 UI 文案（见下条）
-  ├── widgets.py        # 4 个近重复表单 helper（417-497）合并为 add_field()
-  ├── dialogs/fstart.py # F.Start 对话框（600-727）
-  ├── app_state.py      # _collect() 纯函数化（740-832）——可直接单测
-  └── worker.py         # 后台生成/CATIA 发送线程 + 轮询（834-902）
-  ```
-- [ ] **文案语言统一**：页签/按钮中文 vs 字段/分组英文混排（193 "Source" vs 188 "设计"；233 字符串内混排）；F.Start 对话框组题英文、复选框中文、按钮英文。决定一种语言（建议中文 UI + 英文枚举值），集中到 `strings.py`。
-- [ ] **移除生产代码中的测试辅助**：`_wait_for_generation`（881-902）仅测试使用，移到 tests/conftest 或 mixin。
-- [ ] **BLAS 环境变量兜底只留一份**：`main.py:12-16` 与 `geometry/__init__.py:6-12` 重复——抽到单一模块供两处调用。
+- [x] **拆分**：`ui/theme.py`（sv-ttk/字体/muted 色，含 DPI 换算回调）、`ui/constants.py`（窗口/阈值/轮询/超时/颜色）、`ui/dialogs/fstart.py`（F.Start 对话框整体搬移）、`ui/app_state.py`（`collect()` 纯函数化 + `parse_deltas`，可直接单测）；表单 4 helper 的重复样板收敛到 `_field_label/_field_unit`；`main_window.py` 1025 → 744 行。worker.py 未单独拆（后台线程模式 M1 已收敛，拆分收益低）。
+- [x] **移除生产代码中的测试辅助**：`_wait_for_generation` 移至 `tests/test_ui.py` 模块级 `wait_generation(app)`。
+- [x] **BLAS 环境变量兜底只留一份**：删除 `main.py` 的重复块（`geometry/__init__.py` 在 numpy 首次导入前设置）。
+- [x] **文案语言统一（strings.py）**：**作者决定维持现状（中英混排保留），不迁移**（2026-09-03）。
 
 ---
 
 ## 6. M3 —— 测试补强与功能收口（P2）
 
-### 6.1 缺失的测试
+### 6.1 缺失的测试 —— ✅ 完成（2026-09-03）
 
-- [ ] `models/spreads.py` 零直接测试：角度列表解析（`-20,20` 线性 / `0,5,10,15,20` 分段）、`per_facet` 表、`energy_gamma`；
-- [ ] `catia/bridge.py` 仅冒烟：`_select_geometry`、`_convert_step_to_catpart`、`import_step_to_active_part` 用假 COM 对象单测；
-- [ ] UI 纯函数：`_parse_deltas`（741-748）、`_aperture_bounds`（563-570）；
-- [ ] `nurbs.py` 纯 Python 版与 numba 版基函数数值等价性（46-79 vs 116-151，防双实现漂移）；
-- [ ] golden 基线更新流程固化：`capture` 增加 `--out new.npz` + `--compare` 两步流，杜绝「重构后直接重跑把漂移固化为新基线」。
+- [x] `models/spreads.py`：新增 `tests/test_spreads.py`（8 项：线性/分段插值、空与单值回退、per_facet 表、缩放平移、frac 钳制）；
+- [ ] `catia/bridge.py` 假 COM 单测：**保留未做**——`_select_geometry/_convert_step_to_catpart` 需要深度 mock CATIA COM 对象图，投入产出比低；真实路径已有 UI 后台发送测试 + 探测零 Dispatch 测试覆盖；
+- [x] UI 纯函数：`test_parse_deltas_and_aperture_bounds`（parse_deltas 已随 M2 迁至 `ui/app_state.py`，边界四种行为覆盖）；
+- [x] `nurbs.py` 双实现等价：新增 `tests/test_nurbs_equivalence.py`（find_span/basis_funs/eval_surface 的 py vs numba 逐点一致，含随机控制点网格）；
+- [x] golden 两步流：`capture`（默认输出 `.new.npz`，绝不静默覆盖基线）与 `compare`（报告最大偏差，退出码作门禁）。
 
-### 6.2 功能收口（消除「看起来支持实际无效」）
+### 6.2 功能收口 —— ✅ 完成（2026-09-03）
 
-- [ ] `light_target` 枚举 11 种取值，引擎只实现 FAR_FIELD 且对其余值**静默按远场处理**——入口处 `raise NotImplementedError`，UI 只暴露已实现的；
-- [ ] `reflection_coefficient` 只在 summary() 展示、光学求解从未使用——应用它或标注 TODO；
-- [ ] `SpreadsConfig.__post_init__` 对单值角度列表也静默替换为 ±global/2，超出 docstring 承诺——对齐文档或保留单值语义；
-- [ ] 引擎支持而 UI 未暴露：`STEP_BACK/STEP_BACK_NO_GAP`、`GapSurfaceMode` 另 3 种、`LightTargetType` 其余 10 种——要么暴露要么标注「仅 API」；
-- [ ] `_collect` 里的死参数（`step_z=0.0`、`enabled=True`）。
+- [x] `light_target`：`_build_height_field` 入口对非 FAR_FIELD `raise NotImplementedError`（TDD，`test_unsupported_light_target_raises`）；
+- [x] `reflection_coefficient`：标注「未参与几何求解；能量仿真不在项目范围，TODO」；
+- [x] `SpreadsConfig`：docstring 补充单值列表回退行为（行为保留，文档对齐）；
+- [x] 未暴露枚举：`LightTargetType/GapType/GapSurfaceMode` docstring 标注 UI 暴露子集与「仅 API」成员；
+- [x] `_collect` 死参数：`step_z=0.0` 注明「UI 未暴露缝隙 Z 向台阶」。
 
-### 6.3 健壮性细节
+### 6.3 健壮性细节 —— ✅ 完成（2026-09-03）
 
-- [ ] `_eval_target_grid` 的 `except (TypeError, ValueError, IndexError)` 探测会吞掉 target_fn 内部真实 bug——改为显式协议属性（如 `fn.vectorized = True`）；
-- [ ] `_parallel_map` worker 异常丢失面片上下文——re-raise 时附 `(iu, iv)`；
-- [ ] 防御性 `getattr` 掩盖拼写错误（engine.py:211, 913-914, 996, 1483，dataclass 属性必然存在）——改直接访问；
-- [ ] `_lists_for_facet` 对 `per_facet[i_v][i_u]` 无边界校验——加维度上下文报错；
-- [ ] `_shrink_grid` 无收缩时原样返回输入对象、有收缩时返回新数组——统一 copy 语义。
+- [x] `_eval_target_grid` 降级可诊断：数组路径失败时 logger.warning（全局仅一次，防刷屏）；
+- [x] `_parallel_map`：worker 异常 re-raise 附 `facet (iu,iv)` 上下文（RuntimeError 链保留原始异常）；
+- [x] 防御性 `getattr` 清理：`flux.py`（src.axis）、`solve.py`（uniform_intensity）改直接属性访问（其余随 M2 死代码消亡）；
+- [x] `_lists_for_facet`：per_facet 越界报错附表形状与访问下标；
+- [x] `_shrink_grid`：无收缩分支统一返回 `copy()`。
 
 ---
 
@@ -178,10 +160,10 @@
 |---|---|---|
 | M0 | `git status --porcelain` | 输出为空 |
 | M0 | 新机器 `pip install -r requirements.txt -r requirements-dev.txt && pytest -q` | 全绿且无意外 skip |
-| M1 | `pip install -e ".[dev]" && pytest -q` | 全绿；`mf-reflector` 命令可启动 |
-| M1 | GitHub Actions | Windows 全绿 + Linux 按预期 skip |
-| M2 | 每个拆分提交 | `pytest tests/test_golden_height_field.py -q` 不变绿即回滚 |
-| M2 | `wc -l geometry/engine.py ui/main_window.py` | engine < 800（门面+编排）、main_window < 300 |
+| M1 | `pip install -e ".[dev]" && pytest -q` | 已验证全绿（2026-09-03）；入口命令为 `reflab` |
+| M1 | GitHub Actions | 已配置（win 全量 / linux 子集），首次 push 后确认 |
+| M2 | 每个拆分提交 | 已满足：每步 25 测试全绿，黄金基线数值零漂移（2026-09-03） |
+| M2 | `wc -l geometry/engine.py ui/main_window.py` | engine 564 ✅（<800）；main_window 744（dialog/state 拆出后；strings 迁移待产品决策） |
 | M3 | `pytest -q`（Linux 容器） | 除平台标记外全绿 |
 
 ---

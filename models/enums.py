@@ -32,6 +32,7 @@ class EdgeShape(Enum):
 
 
 class GapType(Enum):
+    """缝隙模式。UI 暴露 GAP / NO_GAP；STEP_BACK* 仅可通过 API 使用。"""
     GAP = "gap"
     NO_GAP = "no gap"
     STEP_BACK = "step back"
@@ -39,6 +40,7 @@ class GapType(Enum):
 
 
 class GapSurfaceMode(Enum):
+    """缝隙面选项。UI 暴露 SURFACE/EMPTY（gap 模式）与 NEW_BORDER/OLD_BORDER/AVERAGE（no_gap）；S_SHAPE/INTERSECTION 仅 API。"""
     SURFACE = "surface"
     EMPTY = "empty"
     S_SHAPE = "S shape surface"
@@ -55,6 +57,7 @@ class DraftDirection(Enum):
 
 
 class LightTargetType(Enum):
+    """远场目标类型。引擎仅实现 FAR_FIELD，其余取值在求解入口显式报错；UI 亦只暴露 FAR_FIELD。"""
     FAR_FIELD = "far field"
     NEAR_Z_PLANE = "near Z-plane"
     NEAR_FREE_PLANE = "near free plane"
