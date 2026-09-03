@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MF Reflector 光学原理说明</title>
+<style>
+  :root {
+    --ink: #1b1d21;
+    --muted: #5b616b;
+    --line: #d8dde6;
+    --accent: #1558a0;
+    --accent-bg: #eef4fb;
+    --card: #ffffff;
+    --page: #f6f7f9;
+    --code-bg: #eef0f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 16px/1.75 "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    color: var(--ink);
+    background: var(--page);
+  }
+  header {
+    background: #16233a;
+    color: #fff;
+    padding: 40px 32px 32px;
+  }
+  header .wrap, main, footer .wrap { max-width: 920px; margin: 0 auto; padding: 0 20px; }
+  header .wrap { padding: 0; }
+  header h1 { margin: 0 0 10px; font-size: 28px; }
+  header p { margin: 0; color: #b8c4d8; max-width: 760px; }
+  main { padding: 32px 20px 64px; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 28px 32px;
+    margin-bottom: 24px;
+  }
+  h2 {
+    margin: 0 0 16px;
+    font-size: 21px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid var(--accent-bg);
+    color: var(--accent);
+  }
+  h3 { margin: 22px 0 8px; font-size: 17px; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 8px 0; padding-left: 24px; }
+  li { margin: 4px 0; }
+  code {
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font: 0.88em/1.5 Consolas, "Courier New", monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border-radius: 8px;
+    padding: 14px 18px;
+    overflow-x: auto;
+    font: 0.88em/1.6 Consolas, "Courier New", monospace;
+  }
+  .formula {
+    background: var(--accent-bg);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    padding: 12px 18px;
+    margin: 14px 0;
+    font-family: Cambria, "Times New Roman", serif;
+    font-size: 17px;
+  }
+  .note {
+    color: var(--muted);
+    font-size: 0.92em;
+  }
+  figure { margin: 18px 0; text-align: center; }
+  figcaption { color: var(--muted); font-size: 0.9em; margin-top: 8px; }
+  svg { max-width: 100%; height: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.95em; }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; }
+  th { background: var(--accent-bg); }
+  footer { text-align: center; color: var(--muted); font-size: 0.88em; padding: 0 20px 48px; }
+  @media print {
+    body { background: #fff; }
+    section { border: none; padding: 0 0 20px; break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>MF Reflector 光学原理说明</h1>
+    <p>本文面向希望理解（或参与改进）求解器的使用者与开发者，解释 MF Reflector
+    从「光源 + 面片网格 + 远场角度」到「可制造 NURBS 反射镜」的完整计算流程。</p>
+  </div>
+</header>
+
+<main>
+
+<!-- ================================================================ 1 -->
+<section>
+  <h2>1. 问题定义</h2>
+  <p>给定：</p>
+  <ul>
+    <li>一个<strong>点光源</strong>（位置、发光分布 lambertian / isotropic、可选主光轴）；</li>
+    <li>一个 <strong>U×V 的面片网格</strong>（每片有自己的宽/高尺寸，整体落在一张抛物面载体上）；</li>
+    <li>每个面片的<strong>远场角度分布</strong>（H / V 方向的角度列表，如 <code>-20,20</code> 表示 ±20° 线性扫过）。</li>
+  </ul>
+  <p>要求构造一组互不干涉的自由曲面面片，使得光源发出的光经各面片反射后，
+  在远场按设定角度分布展开——这与 LucidShape 的 MF（MacroFocal）面片反射器语义一致。</p>
+
+  <figure>
+    <svg viewBox="0 0 640 260" width="640" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#1558a0"/>
+        </marker>
+      </defs>
+      <!-- paraboloid carrier -->
+      <path d="M120,30 Q120,230 520,230" fill="none" stroke="#8894a8" stroke-width="2.5"/>
+      <!-- facet grid highlight -->
+      <path d="M200,150 Q210,212 300,222" fill="none" stroke="#1558a0" stroke-width="4"/>
+      <path d="M300,222 Q400,228 480,224" fill="none" stroke="#1558a0" stroke-width="4" stroke-dasharray="6 4"/>
+      <!-- source -->
+      <circle cx="150" cy="90" r="7" fill="#c0392b"/>
+      <text x="162" y="86" font-size="14" fill="#1b1d21">光源 S</text>
+      <!-- ray -->
+      <line x1="155" y1="93" x2="255" y2="196" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arr)"/>
+      <!-- reflected -->
+      <line x1="255" y1="196" x2="500" y2="120" stroke="#1558a0" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="505" y="112" font-size="14" fill="#1558a0">远场方向 R (h, v)</text>
+      <text x="180" y="225" font-size="14" fill="#1558a0">面片网格（U×V）</text>
+      <text x="60" y="40" font-size="14" fill="#8894a8">载体抛物面（焦距 f）</text>
+    </svg>
+    <figcaption>图 1 · 点光源、载体抛物面上的面片网格与远场目标方向</figcaption>
+  </figure>
+</section>
+
+<!-- ================================================================ 2 -->
+<section>
+  <h2>2. 反射定律给出的目标法线</h2>
+  <p>对面片上的每个采样节点 P，入射方向 <strong>I</strong> = unit(P − S)；
+  由该节点的网格参数 (u, v) 查出目标远场方向 <strong>R</strong>(h, v)（角度列表分段插值）。
+  反射定律要求镜面法线平分 <strong>I</strong> 与 <strong>R</strong> 的夹角：</p>
+  <div class="formula">
+    <strong>N</strong><sub>req</sub> = unit( <strong>R</strong> − <strong>I</strong> )，再翻转至指向光源一侧
+  </div>
+  <p>由此得到每个节点的<strong>目标坡度</strong>（斜率场）：</p>
+  <div class="formula">
+    ∂z/∂x = −N<sub>x</sub>/N<sub>z</sub>，　∂z/∂y = −N<sub>y</sub>/N<sub>z</sub>
+  </div>
+  <p class="note">实现见 <code>geometry/engine.py</code> 的 <code>_required_normals()</code> 与
+  <code>_slopes_on_surface()</code>。坡度场计算只依赖 (xs, ys, z, 光源, 目标角度)，
+  与面片绝对高度无关。</p>
+</section>
+
+<!-- ================================================================ 3 -->
+<section>
+  <h2>3. 逐面片求解：从坡度场到高度场</h2>
+  <p>核心难点：按反射定律逐点算出的坡度场<strong>并不严格可积</strong>
+  （∂²z/∂x∂y 在 x 方向与 y 方向的求值顺序不一致），直接沿路径积分会产生路径相关的褶皱。
+  MF Reflector 把它转化为一个<strong>最小二乘梯度匹配问题</strong>：</p>
+  <div class="formula">
+    min<sub>z</sub>　Σ ( (z<sub>j,i+1</sub>−z<sub>j,i</sub>)/Δx − dzx<sub>j,i</sub> )²
+    + Σ ( (z<sub>j+1,i</sub>−z<sub>j,i</sub>)/Δy − dzy<sub>j,i</sub> )²，　z<sub>seed</sub> = 定值
+  </div>
+  <p>即寻找「坡度最贴合反射定律」的光滑高度场。其中：</p>
+  <ul>
+    <li>区间坡度取两端节点坡度的平均（梯形规则），避免向平均角度聚光；</li>
+    <li>网格边界行/列赋予更高权重（<code>edge_weight</code>），保证远场矩形的<strong>轮廓</strong>被遵守；</li>
+    <li>种子点高度固定（Dirichlet 约束），整片高度以此为基准。</li>
+  </ul>
+  <p>该问题组装为稠密线性系统后一次求解。性能优化后，设计矩阵只依赖网格几何，
+  分解一次即可在迭代中反复使用（见第 7 节）。</p>
+
+  <h3>3.1 迭代外环</h3>
+  <p>坡度场本身依赖当前高度 z（改变入射角），因此外环按
+  <code>solver_iterations</code>（默认 5 次）迭代「算坡度 → 重建高度」，
+  直到高度增量 ≤ <code>solver_tolerance</code>（默认 1e-5 mm）。</p>
+
+  <h3>3.2 均匀光强模式</h3>
+  <p>默认模式下角度随面片参数<strong>线性</strong>分布。开启 <code>uniform_intensity</code> 后，
+  程序按入射通量（距离平方衰减 × 发光分布 × 入射角余弦）做<strong>可分离的累积分布映射</strong>：
+  通量大的区域角度被压缩、通量小的区域被拉伸，使远场矩形内光强均匀。
+  该模式额外运行 5 轮空间逆问题迭代与极值抛光，计算时间约为默认模式的数倍。</p>
+</section>
+
+<!-- ================================================================ 4 -->
+<section>
+  <h2>4. 全局求解流水线</h2>
+  <p>单个面片的一次完整生成要经过多个 pass，每个 pass 内所有面片并行计算：</p>
+
+  <figure>
+    <svg viewBox="0 0 720 300" width="720" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#5b616b"/>
+        </marker>
+      </defs>
+      <g font-size="13.5" fill="#1b1d21">
+        <rect x="20"  y="30"  width="150" height="58" rx="9" fill="#eef4fb" stroke="#1558a0"/>
+        <text x="34"  y="54"  font-weight="bold">Pass 1 · 独立求解</text>
+        <text x="34"  y="74"  font-size="12" fill="#5b616b">每片按目标角度绝对求解</text>
+
+        <rect x="215" y="30"  width="170" height="58" rx="9" fill="#eef4fb" stroke="#1558a0"/>
+        <text x="229" y="54"  font-weight="bold">Pass 2 · 仿射校准</text>
+        <text x="229" y="74"  font-size="12" fill="#5b616b">整体范围对齐设定矩形</text>
+
+        <rect x="430" y="30"  width="160" height="58" rx="9" fill="#eef4fb" stroke="#1558a0"/>
+        <text x="444" y="54"  font-weight="bold">Pass 3 · 逆问题迭代</text>
+        <text x="444" y="74"  font-size="12" fill="#5b616b">实测角度−目标角度纠偏</text>
+
+        <rect x="215" y="150" width="170" height="58" rx="9" fill="#f4f6f9" stroke="#8894a8"/>
+        <text x="229" y="174" font-weight="bold">Pass 4 · 邻边基线（可选）</text>
+        <text x="229" y="194" font-size="12" fill="#5b616b">共享边 Dirichlet 重解 → 水密</text>
+
+        <rect x="430" y="150" width="160" height="58" rx="9" fill="#f4f6f9" stroke="#8894a8"/>
+        <text x="444" y="174" font-weight="bold">缝隙面生成</text>
+        <text x="444" y="194" font-size="12" fill="#5b616b">ruled 补片 + Z 步长</text>
+
+        <rect x="215" y="240" width="375" height="44" rx="9" fill="#e8f7ee" stroke="#1b7f3a"/>
+        <text x="229" y="267" font-weight="bold" fill="#1b7f3a">NURBS 拟合 → STEP / STL / OBJ / CATIA</text>
+
+        <line x1="170" y1="59"  x2="212" y2="59"  stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+        <line x1="385" y1="59"  x2="427" y2="59"  stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+        <line x1="510" y1="88"  x2="510" y2="147" stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+        <line x1="430" y1="179" x2="390" y2="179" stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+        <line x1="300" y1="208" x2="300" y2="237" stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+        <line x1="510" y1="208" x2="510" y2="237" stroke="#5b616b" stroke-width="1.6" marker-end="url(#arr2)"/>
+      </g>
+    </svg>
+    <figcaption>图 2 · 一次「生成」的完整流水线（Pass 4 与抛光仅在选择对应选项时执行）</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Pass 1</strong>：每个面片独立、绝对地求解（锚定在载体上）；</li>
+    <li><strong>Pass 2</strong>：对整个远场投影做一次边缘极值仿射校准（仅范围，不锁内部），补偿可积投影的整体拉伸/平移；</li>
+    <li><strong>Pass 3</strong>：计算面片当前的<strong>实际反射角</strong>，与目标角做差后重新提问（逆问题），默认 1 轮，均匀光强 5 轮；</li>
+    <li><strong>Pass 4（可选）</strong>：邻边基线——把相邻面片的共享边曲线取平均后作为边界条件重新求解，使整族面片在共享边处水密（C0）。注意这会轻微牺牲共享边附近的光学精度（两种设计对边缘坡度的要求相反），默认关闭。</li>
+  </ul>
+</section>
+
+<!-- ================================================================ 5 -->
+<section>
+  <h2>5. 缝隙系统</h2>
+  <p>实际灯具中面片之间要有缝隙（避让、散热、外观），MF Reflector 支持三种语义：</p>
+  <table>
+    <tr><th>模式</th><th>含义</th><th>选项</th></tr>
+    <tr><td><code>gap</code></td><td>面片光学尺寸按「宽/高 − 缝隙」收缩，缝隙处生成 ruled 缝隙面</td><td>empty（留空）/ surface（生成缝面）</td></tr>
+    <tr><td><code>no_gap</code></td><td>面片贴合、无缝隙，可选边界生成方式</td><td>new_border / old_border / average</td></tr>
+    <tr><td><code>step_back</code></td><td>面片整体沿法向后退 Z 步长</td><td>同 gap / no_gap</td></tr>
+  </table>
+  <p class="note">尺寸语义遵循 LucidShape：<strong>输入的宽/高包含缝隙</strong>——中间面片光学宽度 = 设定值 − 缝隙，
+  边缘面片 = 设定值 − 缝隙/2，外边界不收缩。见 <code>_shrink_grid()</code>。</p>
+</section>
+
+<!-- ================================================================ 6 -->
+<section>
+  <h2>6. NURBS 拟合与导出</h2>
+  <ul>
+    <li>每个面片的高度场网格拟合为<strong>真正的 B 样条曲面</strong>（阶数默认 5，可调），
+    各子块共享节点矢量以保证跨块的几何连续性；</li>
+    <li><code>Patch Fit</code> 支持 approximation（近似、保尺寸）与 interpolation（插值），
+    多块拟合时可指定 U/V 向块数与连续性（point / tangent）；</li>
+    <li><strong>STEP 导出</strong>：全部光学面与缝隙面经 OpenCascade 缝合为<strong>单一 Shell</strong>，
+    CATIA 收到的是一个连贯实体而非散面；</li>
+    <li><strong>STL / OBJ</strong>：对面片网格三角化后导出，用于快速查看或 3D 打印。</li>
+  </ul>
+</section>
+
+<!-- ================================================================ 7 -->
+<section>
+  <h2>7. 性能架构</h2>
+  <p>16×16（256 面片）网格约 3 秒完成生成，关键措施：</p>
+  <ol>
+    <li><strong>预分解最小二乘</strong>：高度重建的系数矩阵只依赖网格几何，与坡度无关。
+    每个面片只组装/分解一次，迭代中仅做矩阵-向量乘；
+    早期实现每轮迭代都做一遍 SVD 最小二乘，占总耗时约 77%；</li>
+    <li><strong>向量化目标网格</strong>：所有目标角查询闭包支持整网格数组输入，
+    消除每面片每轮数百次 Python 标量调用；</li>
+    <li><strong>并行层级</strong>：面片之间天然独立，由线程池并行（<code>MF_REFLECTOR_JOBS</code> 可调）；
+    BLAS 内部线程限制为 1——小矩阵场景下 OpenBLAS 多线程只有同步开销，
+    两层同时并行会互相踩踏；</li>
+    <li><strong>NURBS 节点搜索</strong>用 numba JIT 加速（<code>geometry/nurbs.py</code>）；</li>
+    <li><strong>黄金基线守护</strong>：<code>tests/test_golden_height_field.py</code> 对 7 组参数矩阵
+    断言优化前后高度场 <code>max|Δz| &lt; 1e-8 mm</code>——所有性能改动都不允许触碰光学结果。</li>
+  </ol>
+</section>
+
+<!-- ================================================================ 8 -->
+<section>
+  <h2>8. 术语对照</h2>
+  <table>
+    <tr><th>界面术语</th><th>本文 / 代码</th><th>说明</th></tr>
+    <tr><td>Carrier focal</td><td>载体焦距 f</td><td>面片所在抛物面载体的焦距</td></tr>
+    <tr><td>Spreads / H, V angles</td><td>远场角度列表</td><td>每面片的远场扫掠范围</td></tr>
+    <tr><td>Edge-ray</td><td>边缘光线模式</td><td>center / min / max：远场范围取角列表的哪种端点</td></tr>
+    <tr><td>F.Start</td><td>计算起点</td><td>相对积分的种子位置（U/V 归一化坐标）</td></tr>
+    <tr><td>Gaps</td><td>缝隙</td><td>面片间间隙及缝隙面</td></tr>
+    <tr><td>Uniform intensity</td><td>均匀光强</td><td>按入射通量重映射角度分布</td></tr>
+    <tr><td>Patch Fit</td><td>曲面拟合</td><td>高度场 → NURBS 的拟合方式与连续性</td></tr>
+  </table>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    MF Reflector · 光学原理说明 ·
+    阅读本文后建议对照 <code>geometry/engine.py</code> 与
+    <a href="../README.md" style="color:#1558a0">项目 README</a> 中的测试用例加深理解
+  </div>
+</footer>
+
+</body>
+</html>

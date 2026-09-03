@@ -1,0 +1,276 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - heading "MF Reflector 光学原理说明" [level=1] [ref=e4]
+      - paragraph [ref=e5]: 本文面向希望理解（或参与改进）求解器的使用者与开发者，解释 MF Reflector 从「光源 + 面片网格 + 远场角度」到「可制造 NURBS 反射镜」的完整计算流程。
+  - main [ref=e6]:
+    - generic [ref=e7]:
+      - heading "1. 问题定义" [level=2] [ref=e8]
+      - paragraph [ref=e9]: 给定：
+      - list [ref=e10]:
+        - listitem [ref=e11]:
+          - text: 一个
+          - strong [ref=e12]: 点光源
+          - text: （位置、发光分布 lambertian / isotropic、可选主光轴）；
+        - listitem [ref=e13]:
+          - text: 一个
+          - strong [ref=e14]: U×V 的面片网格
+          - text: （每片有自己的宽/高尺寸，整体落在一张抛物面载体上）；
+        - listitem [ref=e15]:
+          - text: 每个面片的
+          - strong [ref=e16]: 远场角度分布
+          - text: （H / V 方向的角度列表，如
+          - code [ref=e17]: "-20,20"
+          - text: 表示 ±20° 线性扫过）。
+      - paragraph [ref=e18]: 要求构造一组互不干涉的自由曲面面片，使得光源发出的光经各面片反射后， 在远场按设定角度分布展开——这与 LucidShape 的 MF（MacroFocal）面片反射器语义一致。
+      - figure "图 1 · 点光源、载体抛物面上的面片网格与远场目标方向" [ref=e19]:
+        - img [ref=e20]:
+          - generic [ref=e25]: 光源 S
+          - generic [ref=e28]: 远场方向 R (h, v)
+          - generic [ref=e29]: 面片网格（U×V）
+          - generic [ref=e30]: 载体抛物面（焦距 f）
+    - generic [ref=e32]:
+      - heading "2. 反射定律给出的目标法线" [level=2] [ref=e33]
+      - paragraph [ref=e34]:
+        - text: 对面片上的每个采样节点 P，入射方向
+        - strong [ref=e35]: I
+        - text: = unit(P − S)； 由该节点的网格参数 (u, v) 查出目标远场方向
+        - strong [ref=e36]: R
+        - text: (h, v)（角度列表分段插值）。 反射定律要求镜面法线平分
+        - strong [ref=e37]: I
+        - text: 与
+        - strong [ref=e38]: R
+        - text: 的夹角：
+      - generic [ref=e39]:
+        - strong [ref=e40]: "N"
+        - subscript [ref=e41]: req
+        - text: = unit(
+        - strong [ref=e42]: R
+        - text: −
+        - strong [ref=e43]: I
+        - text: )，再翻转至指向光源一侧
+      - paragraph [ref=e44]:
+        - text: 由此得到每个节点的
+        - strong [ref=e45]: 目标坡度
+        - text: （斜率场）：
+      - generic [ref=e46]:
+        - text: ∂z/∂x = −N
+        - subscript [ref=e47]: x
+        - text: /N
+        - subscript [ref=e48]: z
+        - text: ， ∂z/∂y = −N
+        - subscript [ref=e49]: "y"
+        - text: /N
+        - subscript [ref=e50]: z
+      - paragraph [ref=e51]:
+        - text: 实现见
+        - code [ref=e52]: geometry/engine.py
+        - text: 的
+        - code [ref=e53]: _required_normals()
+        - text: 与
+        - code [ref=e54]: _slopes_on_surface()
+        - text: 。坡度场计算只依赖 (xs, ys, z, 光源, 目标角度)， 与面片绝对高度无关。
+    - generic [ref=e55]:
+      - heading "3. 逐面片求解：从坡度场到高度场" [level=2] [ref=e56]
+      - paragraph [ref=e57]:
+        - text: 核心难点：按反射定律逐点算出的坡度场
+        - strong [ref=e58]: 并不严格可积
+        - text: （∂²z/∂x∂y 在 x 方向与 y 方向的求值顺序不一致），直接沿路径积分会产生路径相关的褶皱。 MF Reflector 把它转化为一个
+        - strong [ref=e59]: 最小二乘梯度匹配问题
+        - text: ：
+      - generic [ref=e60]:
+        - text: min
+        - subscript [ref=e61]: z
+        - text: Σ ( (z
+        - subscript [ref=e62]: j,i+1
+        - text: −z
+        - subscript [ref=e63]: j,i
+        - text: )/Δx − dzx
+        - subscript [ref=e64]: j,i
+        - text: )² + Σ ( (z
+        - subscript [ref=e65]: j+1,i
+        - text: −z
+        - subscript [ref=e66]: j,i
+        - text: )/Δy − dzy
+        - subscript [ref=e67]: j,i
+        - text: )²， z
+        - subscript [ref=e68]: seed
+        - text: = 定值
+      - paragraph [ref=e69]: 即寻找「坡度最贴合反射定律」的光滑高度场。其中：
+      - list [ref=e70]:
+        - listitem [ref=e71]: 区间坡度取两端节点坡度的平均（梯形规则），避免向平均角度聚光；
+        - listitem [ref=e72]:
+          - text: 网格边界行/列赋予更高权重（
+          - code [ref=e73]: edge_weight
+          - text: ），保证远场矩形的
+          - strong [ref=e74]: 轮廓
+          - text: 被遵守；
+        - listitem [ref=e75]: 种子点高度固定（Dirichlet 约束），整片高度以此为基准。
+      - paragraph [ref=e76]: 该问题组装为稠密线性系统后一次求解。性能优化后，设计矩阵只依赖网格几何， 分解一次即可在迭代中反复使用（见第 7 节）。
+      - heading "3.1 迭代外环" [level=3] [ref=e77]
+      - paragraph [ref=e78]:
+        - text: 坡度场本身依赖当前高度 z（改变入射角），因此外环按
+        - code [ref=e79]: solver_iterations
+        - text: （默认 5 次）迭代「算坡度 → 重建高度」， 直到高度增量 ≤
+        - code [ref=e80]: solver_tolerance
+        - text: （默认 1e-5 mm）。
+      - heading "3.2 均匀光强模式" [level=3] [ref=e81]
+      - paragraph [ref=e82]:
+        - text: 默认模式下角度随面片参数
+        - strong [ref=e83]: 线性
+        - text: 分布。开启
+        - code [ref=e84]: uniform_intensity
+        - text: 后， 程序按入射通量（距离平方衰减 × 发光分布 × 入射角余弦）做
+        - strong [ref=e85]: 可分离的累积分布映射
+        - text: ： 通量大的区域角度被压缩、通量小的区域被拉伸，使远场矩形内光强均匀。 该模式额外运行 5 轮空间逆问题迭代与极值抛光，计算时间约为默认模式的数倍。
+    - generic [ref=e86]:
+      - heading "4. 全局求解流水线" [level=2] [ref=e87]
+      - paragraph [ref=e88]: 单个面片的一次完整生成要经过多个 pass，每个 pass 内所有面片并行计算：
+      - figure "图 2 · 一次「生成」的完整流水线（Pass 4 与抛光仅在选择对应选项时执行）" [ref=e89]:
+        - img [ref=e90]:
+          - generic [ref=e91]:
+            - generic [ref=e93]: Pass 1 · 独立求解
+            - generic [ref=e94]: 每片按目标角度绝对求解
+            - generic [ref=e96]: Pass 2 · 仿射校准
+            - generic [ref=e97]: 整体范围对齐设定矩形
+            - generic [ref=e99]: Pass 3 · 逆问题迭代
+            - generic [ref=e100]: 实测角度−目标角度纠偏
+            - generic [ref=e102]: Pass 4 · 邻边基线（可选）
+            - generic [ref=e103]: 共享边 Dirichlet 重解 → 水密
+            - generic [ref=e105]: 缝隙面生成
+            - generic [ref=e106]: ruled 补片 + Z 步长
+            - generic [ref=e108]: NURBS 拟合 → STEP / STL / OBJ / CATIA
+      - list [ref=e110]:
+        - listitem [ref=e111]:
+          - strong [ref=e112]: Pass 1
+          - text: ：每个面片独立、绝对地求解（锚定在载体上）；
+        - listitem [ref=e113]:
+          - strong [ref=e114]: Pass 2
+          - text: ：对整个远场投影做一次边缘极值仿射校准（仅范围，不锁内部），补偿可积投影的整体拉伸/平移；
+        - listitem [ref=e115]:
+          - strong [ref=e116]: Pass 3
+          - text: ：计算面片当前的
+          - strong [ref=e117]: 实际反射角
+          - text: ，与目标角做差后重新提问（逆问题），默认 1 轮，均匀光强 5 轮；
+        - listitem [ref=e118]:
+          - strong [ref=e119]: Pass 4（可选）
+          - text: ：邻边基线——把相邻面片的共享边曲线取平均后作为边界条件重新求解，使整族面片在共享边处水密（C0）。注意这会轻微牺牲共享边附近的光学精度（两种设计对边缘坡度的要求相反），默认关闭。
+    - generic [ref=e120]:
+      - heading "5. 缝隙系统" [level=2] [ref=e121]
+      - paragraph [ref=e122]: 实际灯具中面片之间要有缝隙（避让、散热、外观），MF Reflector 支持三种语义：
+      - table [ref=e123]:
+        - rowgroup [ref=e124]:
+          - row [ref=e125]:
+            - columnheader "模式" [ref=e126]
+            - columnheader "含义" [ref=e127]
+            - columnheader "选项" [ref=e128]
+          - row [ref=e129]:
+            - cell [ref=e130]:
+              - code [ref=e131]: gap
+            - cell "面片光学尺寸按「宽/高 − 缝隙」收缩，缝隙处生成 ruled 缝隙面" [ref=e132]
+            - cell "empty（留空）/ surface（生成缝面）" [ref=e133]
+          - row [ref=e134]:
+            - cell [ref=e135]:
+              - code [ref=e136]: no_gap
+            - cell "面片贴合、无缝隙，可选边界生成方式" [ref=e137]
+            - cell "new_border / old_border / average" [ref=e138]
+          - row [ref=e139]:
+            - cell [ref=e140]:
+              - code [ref=e141]: step_back
+            - cell "面片整体沿法向后退 Z 步长" [ref=e142]
+            - cell "同 gap / no_gap" [ref=e143]
+      - paragraph [ref=e144]:
+        - text: 尺寸语义遵循 LucidShape：
+        - strong [ref=e145]: 输入的宽/高包含缝隙
+        - text: ——中间面片光学宽度 = 设定值 − 缝隙， 边缘面片 = 设定值 − 缝隙/2，外边界不收缩。见
+        - code [ref=e146]: _shrink_grid()
+        - text: 。
+    - generic [ref=e147]:
+      - heading "6. NURBS 拟合与导出" [level=2] [ref=e148]
+      - list [ref=e149]:
+        - listitem [ref=e150]:
+          - text: 每个面片的高度场网格拟合为
+          - strong [ref=e151]: 真正的 B 样条曲面
+          - text: （阶数默认 5，可调）， 各子块共享节点矢量以保证跨块的几何连续性；
+        - listitem [ref=e152]:
+          - code [ref=e153]: Patch Fit
+          - text: 支持 approximation（近似、保尺寸）与 interpolation（插值）， 多块拟合时可指定 U/V 向块数与连续性（point / tangent）；
+        - listitem [ref=e154]:
+          - strong [ref=e155]: STEP 导出
+          - text: ：全部光学面与缝隙面经 OpenCascade 缝合为
+          - strong [ref=e156]: 单一 Shell
+          - text: ， CATIA 收到的是一个连贯实体而非散面；
+        - listitem [ref=e157]:
+          - strong [ref=e158]: STL / OBJ
+          - text: ：对面片网格三角化后导出，用于快速查看或 3D 打印。
+    - generic [ref=e159]:
+      - heading "7. 性能架构" [level=2] [ref=e160]
+      - paragraph [ref=e161]: 16×16（256 面片）网格约 3 秒完成生成，关键措施：
+      - list [ref=e162]:
+        - listitem [ref=e163]:
+          - strong [ref=e164]: 预分解最小二乘
+          - text: ：高度重建的系数矩阵只依赖网格几何，与坡度无关。 每个面片只组装/分解一次，迭代中仅做矩阵-向量乘； 早期实现每轮迭代都做一遍 SVD 最小二乘，占总耗时约 77%；
+        - listitem [ref=e165]:
+          - strong [ref=e166]: 向量化目标网格
+          - text: ：所有目标角查询闭包支持整网格数组输入， 消除每面片每轮数百次 Python 标量调用；
+        - listitem [ref=e167]:
+          - strong [ref=e168]: 并行层级
+          - text: ：面片之间天然独立，由线程池并行（
+          - code [ref=e169]: MF_REFLECTOR_JOBS
+          - text: 可调）； BLAS 内部线程限制为 1——小矩阵场景下 OpenBLAS 多线程只有同步开销， 两层同时并行会互相踩踏；
+        - listitem [ref=e170]:
+          - strong [ref=e171]: NURBS 节点搜索
+          - text: 用 numba JIT 加速（
+          - code [ref=e172]: geometry/nurbs.py
+          - text: ）；
+        - listitem [ref=e173]:
+          - strong [ref=e174]: 黄金基线守护
+          - text: ：
+          - code [ref=e175]: tests/test_golden_height_field.py
+          - text: 对 7 组参数矩阵 断言优化前后高度场
+          - code [ref=e176]: max|Δz| < 1e-8 mm
+          - text: ——所有性能改动都不允许触碰光学结果。
+    - generic [ref=e177]:
+      - heading "8. 术语对照" [level=2] [ref=e178]
+      - table [ref=e179]:
+        - rowgroup [ref=e180]:
+          - row [ref=e181]:
+            - columnheader "界面术语" [ref=e182]
+            - columnheader "本文 / 代码" [ref=e183]
+            - columnheader "说明" [ref=e184]
+          - row [ref=e185]:
+            - cell "Carrier focal" [ref=e186]
+            - cell "载体焦距 f" [ref=e187]
+            - cell "面片所在抛物面载体的焦距" [ref=e188]
+          - row [ref=e189]:
+            - cell "Spreads / H, V angles" [ref=e190]
+            - cell "远场角度列表" [ref=e191]
+            - cell "每面片的远场扫掠范围" [ref=e192]
+          - row [ref=e193]:
+            - cell "Edge-ray" [ref=e194]
+            - cell "边缘光线模式" [ref=e195]
+            - cell "center / min / max：远场范围取角列表的哪种端点" [ref=e196]
+          - row [ref=e197]:
+            - cell "F.Start" [ref=e198]
+            - cell "计算起点" [ref=e199]
+            - cell "相对积分的种子位置（U/V 归一化坐标）" [ref=e200]
+          - row [ref=e201]:
+            - cell "Gaps" [ref=e202]
+            - cell "缝隙" [ref=e203]
+            - cell "面片间间隙及缝隙面" [ref=e204]
+          - row [ref=e205]:
+            - cell "Uniform intensity" [ref=e206]
+            - cell "均匀光强" [ref=e207]
+            - cell "按入射通量重映射角度分布" [ref=e208]
+          - row [ref=e209]:
+            - cell "Patch Fit" [ref=e210]
+            - cell "曲面拟合" [ref=e211]
+            - cell "高度场 → NURBS 的拟合方式与连续性" [ref=e212]
+  - contentinfo [ref=e213]:
+    - generic [ref=e214]:
+      - text: MF Reflector · 光学原理说明 · 阅读本文后建议对照
+      - code [ref=e215]: geometry/engine.py
+      - text: 与
+      - link "项目 README" [ref=e216] [cursor=pointer]:
+        - /url: ../README.md
+      - text: 中的测试用例加深理解
