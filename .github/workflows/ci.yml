@@ -37,5 +37,11 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Test
+      # Tk UI 测试需要显示器：Linux runner 无 X server，用预装的 xvfb 提供虚拟显示
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pytest -q
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
         run: pytest -q
