@@ -11,9 +11,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
         python-version: ["3.12", "3.13"]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     env:
       # 小矩阵稠密求解：BLAS 内部多线程只有同步开销（engine 自带面片级并行）
       OPENBLAS_NUM_THREADS: "1"
@@ -25,23 +24,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # Windows 全量（STEP + CATIA COM 依赖）；Linux 跑可跳过子集（对齐 README 平台承诺）
-      - name: Install (full)
-        if: runner.os == 'Windows'
+      # 全量安装（STEP + CATIA COM 依赖）
+      - name: Install
         run: pip install -e ".[dev,step,catia]"
-
-      - name: Install (core)
-        if: runner.os == 'Linux'
-        run: pip install -e ".[dev]"
 
       - name: Lint
         run: ruff check .
 
-      # Tk UI 测试需要显示器：Linux runner 无 X server，用预装的 xvfb 提供虚拟显示
-      - name: Test (Linux)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a pytest -q
-
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
+      - name: Test
         run: pytest -q

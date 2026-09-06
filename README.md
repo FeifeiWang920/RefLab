@@ -91,7 +91,7 @@ pytest -q
 ruff check .
 ```
 
-CI（GitHub Actions）在 Windows 上跑全量、Linux 上跑可跳过子集，每次 push 均执行黄金基线对照。
+CI（GitHub Actions）在 Windows 上跑全量（Python 3.12 / 3.13），每次 push 均执行黄金基线对照。
 
 - `tests/test_engine_features.py`：求解器、缝隙、拟合等引擎特性测试
 - `tests/test_ui.py`：界面冒烟测试（页签、对话框、后台生成、主题字体）
